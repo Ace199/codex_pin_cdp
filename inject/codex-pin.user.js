@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const VERSION = "0.6.3"; // Mirror Pin files into the active workspace for Codex native file search.
+  const VERSION = "0.6.4"; // Keep native-search mirrors in each workspace's pins directory.
   const API_KEY = "__codexChatPinInjection__";
   const STYLE_ID = "codex-chat-pin-style";
   const BUTTON_ATTRIBUTE = "data-codex-chat-pin-button";

@@ -135,6 +135,20 @@ function indexVisibilityRules(filePath, workspacePath) {
   };
 }
 
+function gitIgnoreReason(filePath, workspacePath) {
+  const result = spawnSync("git", [
+    "-C",
+    workspacePath,
+    "check-ignore",
+    "-v",
+    "--no-index",
+    "--",
+    filePath,
+  ], { encoding: "utf8", windowsHide: true });
+  if (result.status !== 0 || !result.stdout?.trim()) return "";
+  return result.stdout.trim().split(/\r?\n/).at(-1) || "";
+}
+
 async function withPinVisibleToNativeIndexer(filePath, workspacePath, action) {
   const run = async () => {
     const visibility = indexVisibilityRules(filePath, workspacePath);
@@ -158,7 +172,15 @@ async function withPinVisibleToNativeIndexer(filePath, workspacePath, action) {
           await delay(120);
         }
       }
-      return await action();
+      const remainingIgnoreReason = gitIgnoreReason(filePath, workspacePath);
+      const result = await action();
+      if (result?.ok !== true && remainingIgnoreReason) {
+        return {
+          ...result,
+          error: `${result?.error || "原生文件打开失败"}；该镜像仍被工作区忽略规则排除：${remainingIgnoreReason}`,
+        };
+      }
+      return result;
     } finally {
       if (visibility?.excludePath) {
         try {
@@ -241,7 +263,12 @@ async function explainNativeOpenFailure(cdp, result, filePath) {
   if (!workspacePath) return result;
   const relative = path.relative(workspacePath, filePath);
   const fileIsInWorkspace = relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-  if (fileIsInWorkspace) return result;
+  if (fileIsInWorkspace) {
+    return {
+      ...result,
+      error: `${result?.error || "原生文件打开失败"}；搜索工作区是 ${workspacePath}，Pin 镜像是 ${filePath}`,
+    };
+  }
   return {
     ...result,
     error: `${result?.error || "原生文件打开失败"}；当前任务工作区是 ${workspacePath}，Pin 文件保存在 ${root}`,
@@ -267,7 +294,7 @@ async function nativePinTarget(cdp, sessionId) {
   }
   return {
     canonicalPath,
-    filePath: path.join(workspacePath, path.basename(canonicalPath)),
+    filePath: path.join(workspacePath, "pins", path.basename(canonicalPath)),
     workspacePath,
     mirrored: true,
   };
@@ -545,10 +572,13 @@ async function openNativeFileTab(cdp, filePath, options = {}) {
   filterPoint ||= await waitForPoint(cdp, filterPointExpression, 6_000);
   if (!filterPoint) return { ok: false, error: "Codex 原生“打开文件”页未出现" };
 
-  await clickPoint(cdp, filterPoint);
-  await pressKey(cdp, { key: "a", code: "KeyA", windowsVirtualKeyCode: 65, modifiers: 2 });
-  await pressKey(cdp, { key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8 });
-  await cdp.send("Input.insertText", { text: wantedFileName });
+  const refreshFilter = async () => {
+    await clickPoint(cdp, filterPoint);
+    await pressKey(cdp, { key: "a", code: "KeyA", windowsVirtualKeyCode: 65, modifiers: 2 });
+    await pressKey(cdp, { key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8 });
+    await cdp.send("Input.insertText", { text: wantedFileName });
+  };
+  await refreshFilter();
   const firstResultPointExpression = `(() => {
     const visible = (node) => node?.isConnected && node.getClientRects().length > 0;
     const filter = [...document.querySelectorAll('input')].find((node) => visible(node) && /筛选文件|filter files?/i.test(node.placeholder || node.getAttribute('aria-label') || ''));
@@ -634,12 +664,17 @@ async function openNativeFileTab(cdp, filePath, options = {}) {
 
   let candidate = null;
   if (!opened) {
-    // A genuinely slow workspace index is waited on, but the polling exits on
-    // the first rendered filename rather than imposing a fixed delay.
-    candidate = await waitForPoint(cdp, candidateExpression, 3_000, 50);
-    if (candidate) {
-      await clickPoint(cdp, candidate);
-      opened = await waitForNativeFileTab(cdp, wantedFileName, 1_200);
+    // Some Codex builds do not refresh an active filename query when their
+    // workspace index notices a newly-created file. Retype the exact query at
+    // increasing intervals; each attempt still exits as soon as a row appears.
+    for (const refreshWindowMs of [350, 700, 1_400, 2_400]) {
+      await refreshFilter();
+      candidate = await waitForPoint(cdp, candidateExpression, refreshWindowMs, 50);
+      if (candidate) {
+        await clickPoint(cdp, candidate);
+        opened = await waitForNativeFileTab(cdp, wantedFileName, 1_200);
+      }
+      if (opened) break;
     }
   }
   if (!opened) return { ok: false, error: `Codex 文件筛选器中未找到 ${wantedFileName}` };
@@ -773,7 +808,10 @@ async function inject(browser, known) {
           if (change.openAfterSave === true) {
             try {
               target = await nativePinTarget(cdp, sessionId);
-              if (target.mirrored) await writePinFile(target.filePath, change.text);
+              if (target.mirrored) {
+                await mkdir(path.dirname(target.filePath), { recursive: true });
+                await writePinFile(target.filePath, change.text);
+              }
               openResult = await withPinVisibleToNativeIndexer(
                 target.filePath,
                 target.workspacePath,
@@ -809,6 +847,7 @@ async function inject(browser, known) {
             await stat(canonicalPinFilePath);
             const target = await nativePinTarget(cdp, sessionId);
             if (target.mirrored) {
+              await mkdir(path.dirname(target.filePath), { recursive: true });
               try {
                 await stat(target.filePath);
               } catch (error) {
