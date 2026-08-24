@@ -1,0 +1,8 @@
+.codex-pin-profile/
+temp/
+node_modules/
+*.log
+
+# Local development context; not part of the distributable project.
+AGENTS.md
+reference/
