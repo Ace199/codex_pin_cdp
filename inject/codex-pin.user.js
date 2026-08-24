@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const VERSION = "0.5.7"; // Store Pin files in a workspace-visible directory outside .gitignore.
+  const VERSION = "0.5.8"; // Use the exact-search result as the native file opening fast path.
   const API_KEY = "__codexChatPinInjection__";
   const STYLE_ID = "codex-chat-pin-style";
   const BUTTON_ATTRIBUTE = "data-codex-chat-pin-button";
@@ -420,7 +420,8 @@
     }
     lastPinnedFingerprint = pending.fingerprint;
     refresh();
-    toast(`已保存并打开 ${message.fileName}`);
+    const elapsed = Number.isFinite(message.openResult?.elapsedMs) ? `（${message.openResult.elapsedMs}ms）` : "";
+    toast(`已保存并打开 ${message.fileName}${elapsed}`);
   }
 
   function schedule() {

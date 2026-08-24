@@ -164,22 +164,23 @@ async function nativeFileTabPoint(cdp, fileName) {
   })()`);
 }
 
-async function waitForNativeFileTab(cdp, fileName, timeoutMs = 1_200) {
+async function waitForNativeFileTab(cdp, fileName, timeoutMs = 1_200, intervalMs = 24) {
   const deadline = Date.now() + timeoutMs;
   do {
     const point = await nativeFileTabPoint(cdp, fileName);
     if (point) return point;
-    await delay(40);
+    await delay(intervalMs);
   } while (Date.now() < deadline);
   return null;
 }
 
 async function openNativeFileTab(cdp, filePath, options = {}) {
+  const startedAt = Date.now();
   const wantedFileName = path.basename(filePath);
   const existing = await nativeFileTabPoint(cdp, wantedFileName);
   if (existing) {
     await clickPoint(cdp, existing);
-    return { ok: true, status: "existing", fileName: wantedFileName };
+    return { ok: true, status: "existing", fileName: wantedFileName, elapsedMs: Date.now() - startedAt };
   }
 
   const fileMenuPointExpression = (anchor = null) => `(() => {
@@ -381,6 +382,13 @@ async function openNativeFileTab(cdp, filePath, options = {}) {
   await pressKey(cdp, { key: "a", code: "KeyA", windowsVirtualKeyCode: 65, modifiers: 2 });
   await pressKey(cdp, { key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8 });
   await cdp.send("Input.insertText", { text: wantedFileName });
+  const firstResultPointExpression = `(() => {
+    const visible = (node) => node?.isConnected && node.getClientRects().length > 0;
+    const filter = [...document.querySelectorAll('input')].find((node) => visible(node) && /筛选文件|filter files?/i.test(node.placeholder || node.getAttribute('aria-label') || ''));
+    if (!filter) return null;
+    const rect = filter.getBoundingClientRect();
+    return { x: rect.left + Math.min(rect.width / 2, 220), y: rect.bottom + 52 };
+  })()`;
   const candidateExpression = `(() => {
     const expected = ${JSON.stringify(wantedFileName)}.toLowerCase();
     const prefix = expected.slice(0, Math.min(8, expected.length));
@@ -434,33 +442,30 @@ async function openNativeFileTab(cdp, filePath, options = {}) {
     matches.sort((left, right) => left.distance - right.distance || left.area - right.area);
     return matches[0] || null;
   })()`;
-  let candidate = await waitForPoint(cdp, candidateExpression, 450, 30);
+  // An exact filename search has one native result. Current Codex builds do
+  // not expose a stable role for that row, so try its native position first
+  // instead of paying the old 450ms semantic scan + 700ms fallback wait.
+  // Repeated attempts are bounded and stop as soon as the file tab appears.
+  let opened = null;
+  for (const settleMs of [18, 72, 120]) {
+    await delay(settleMs);
+    const firstResultPoint = await evaluateValue(cdp, firstResultPointExpression);
+    if (!firstResultPoint) break;
+    await clickPoint(cdp, firstResultPoint);
+    opened = await waitForNativeFileTab(cdp, wantedFileName, 150, 18);
+    if (opened) break;
+  }
 
-  if (candidate) {
-    await clickPoint(cdp, candidate);
-  } else {
+  // Keyboard selection is the second fast path for builds whose first row is
+  // positioned differently. It is attempted only while the filter is active.
+  if (!opened) {
     await clickPoint(cdp, filterPoint);
     await pressKey(cdp, { key: "ArrowDown", code: "ArrowDown", windowsVirtualKeyCode: 40 });
     await pressKey(cdp, { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+    opened = await waitForNativeFileTab(cdp, wantedFileName, 260, 20);
   }
 
-  let opened = await waitForNativeFileTab(cdp, wantedFileName, 700);
-  if (!opened) {
-    // The exact search has a single result. This coordinate is the native
-    // first-result row used by current Codex builds and replaces the old six-
-    // second wait when that row lacks semantic attributes.
-    const firstResultPoint = await evaluateValue(cdp, `(() => {
-      const visible = (node) => node?.isConnected && node.getClientRects().length > 0;
-      const filter = [...document.querySelectorAll('input')].find((node) => visible(node) && /筛选文件|filter files?/i.test(node.placeholder || node.getAttribute('aria-label') || ''));
-      if (!filter) return null;
-      const rect = filter.getBoundingClientRect();
-      return { x: rect.left + Math.min(rect.width / 2, 220), y: rect.bottom + 52 };
-    })()`);
-    if (firstResultPoint) {
-      await clickPoint(cdp, firstResultPoint);
-      opened = await waitForNativeFileTab(cdp, wantedFileName, 700);
-    }
-  }
+  let candidate = null;
   if (!opened) {
     // A genuinely slow workspace index is waited on, but the polling exits on
     // the first rendered filename rather than imposing a fixed delay.
@@ -472,7 +477,7 @@ async function openNativeFileTab(cdp, filePath, options = {}) {
   }
   if (!opened) return { ok: false, error: `Codex 文件筛选器中未找到 ${wantedFileName}` };
   await clickPoint(cdp, opened);
-  return { ok: true, status: "opened", fileName: wantedFileName };
+  return { ok: true, status: "opened", fileName: wantedFileName, elapsedMs: Date.now() - startedAt };
 }
 
 async function writePinFile(filePath, text) {
