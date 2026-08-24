@@ -89,18 +89,70 @@ async function preparePinStorage() {
 
 await preparePinStorage();
 
-async function withPinVisibleToNativeIndexer(action) {
+function samePath(left, right) {
+  const normalize = (value) => {
+    const resolved = path.resolve(value);
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  };
+  return normalize(left) === normalize(right);
+}
+
+function gitContextForWorkspace(workspacePath) {
+  const topLevelResult = spawnSync("git", [
+    "-C",
+    workspacePath,
+    "rev-parse",
+    "--show-toplevel",
+  ], { encoding: "utf8", windowsHide: true });
+  const excludeResult = spawnSync("git", [
+    "-C",
+    workspacePath,
+    "rev-parse",
+    "--path-format=absolute",
+    "--git-path",
+    "info/exclude",
+  ], { encoding: "utf8", windowsHide: true });
+  if (topLevelResult.status !== 0 || !topLevelResult.stdout?.trim()
+    || excludeResult.status !== 0 || !excludeResult.stdout?.trim()) return null;
+  const topLevel = path.resolve(topLevelResult.stdout.trim());
+  const excludeValue = excludeResult.stdout.trim();
+  const excludePath = path.isAbsolute(excludeValue)
+    ? excludeValue
+    : path.resolve(workspacePath, excludeValue);
+  return { topLevel, excludePath };
+}
+
+function indexVisibilityRules(filePath, workspacePath) {
+  const gitContext = gitContextForWorkspace(workspacePath);
+  if (!gitContext) return null;
+  const relative = path.relative(gitContext.topLevel, filePath);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return null;
+  const exactRule = `/${relative.replaceAll("\\", "/")}`;
+  return {
+    excludePath: gitContext.excludePath,
+    exactRule,
+    protectRule: samePath(workspacePath, root) ? pinGitExcludeRule : exactRule,
+  };
+}
+
+async function withPinVisibleToNativeIndexer(filePath, workspacePath, action) {
   const run = async () => {
-    let excludeRuleRemoved = false;
+    const visibility = indexVisibilityRules(filePath, workspacePath);
+    const removedRules = [];
     try {
-      if (existsSync(localGitExcludePath)) {
-        const current = await readFile(localGitExcludePath, "utf8");
+      if (visibility?.excludePath && existsSync(visibility.excludePath)) {
+        const current = await readFile(visibility.excludePath, "utf8");
         const newline = current.includes("\r\n") ? "\r\n" : "\n";
         const lines = current.split(/\r?\n/);
-        const filtered = lines.filter((line) => line.trim() !== pinGitExcludeRule);
+        const filtered = lines.filter((line) => {
+          const rule = line.trim();
+          const shouldRemove = rule === visibility.exactRule
+            || (samePath(workspacePath, root) && rule === pinGitExcludeRule);
+          if (shouldRemove) removedRules.push(line);
+          return !shouldRemove;
+        });
         if (filtered.length !== lines.length) {
-          await writeFile(localGitExcludePath, filtered.join(newline), "utf8");
-          excludeRuleRemoved = true;
+          await writeFile(visibility.excludePath, filtered.join(newline), "utf8");
           // Codex maintains its own workspace file list. Give its watcher one
           // short turn to observe the local exclude change before searching.
           await delay(120);
@@ -108,16 +160,23 @@ async function withPinVisibleToNativeIndexer(action) {
       }
       return await action();
     } finally {
-      if (excludeRuleRemoved) {
+      if (visibility?.excludePath) {
         try {
-          const current = await readFile(localGitExcludePath, "utf8");
+          const current = await readFile(visibility.excludePath, "utf8").catch((error) => {
+            if (error.code === "ENOENT") return "";
+            throw error;
+          });
           const rules = current.split(/\r?\n/).map((line) => line.trim());
-          if (!rules.includes(pinGitExcludeRule)) {
+          const restore = [...removedRules, visibility.protectRule]
+            .filter((rule, index, all) => rule && all.indexOf(rule) === index)
+            .filter((rule) => !rules.includes(rule.trim()));
+          if (restore.length) {
             const separator = current && !current.endsWith("\n") ? "\n" : "";
-            await writeFile(localGitExcludePath, `${current}${separator}${pinGitExcludeRule}\n`, "utf8");
+            await mkdir(path.dirname(visibility.excludePath), { recursive: true });
+            await writeFile(visibility.excludePath, `${current}${separator}${restore.join("\n")}\n`, "utf8");
           }
         } catch (error) {
-          console.warn(`Chat Pin could not restore .git/info/exclude: ${error.message}`);
+          console.warn(`Chat Pin could not protect the workspace Pin mirror in Git: ${error.message}`);
         }
       }
     }
@@ -186,6 +245,31 @@ async function explainNativeOpenFailure(cdp, result, filePath) {
   return {
     ...result,
     error: `${result?.error || "原生文件打开失败"}；当前任务工作区是 ${workspacePath}，Pin 文件保存在 ${root}`,
+  };
+}
+
+async function nativePinTarget(cdp, sessionId) {
+  const canonicalPath = pinFileFor(sessionId);
+  const context = await nativeWorkspaceContext(cdp);
+  const candidate = context?.workspacePath?.trim();
+  if (!candidate || !path.isAbsolute(candidate)) {
+    return { canonicalPath, filePath: canonicalPath, workspacePath: root, mirrored: false };
+  }
+  const workspacePath = path.resolve(candidate);
+  try {
+    const workspaceInfo = await stat(workspacePath);
+    if (!workspaceInfo.isDirectory()) throw new Error("workspace root is not a directory");
+  } catch {
+    return { canonicalPath, filePath: canonicalPath, workspacePath: root, mirrored: false };
+  }
+  if (samePath(workspacePath, root)) {
+    return { canonicalPath, filePath: canonicalPath, workspacePath, mirrored: false };
+  }
+  return {
+    canonicalPath,
+    filePath: path.join(workspacePath, path.basename(canonicalPath)),
+    workspacePath,
+    mirrored: true,
   };
 }
 
@@ -680,39 +764,69 @@ async function inject(browser, known) {
         change = JSON.parse(payload);
         if (!change || typeof change !== "object") return;
         const sessionId = safeSessionId(change.sessionId);
-        const pinFilePath = pinFileFor(sessionId);
+        const canonicalPinFilePath = pinFileFor(sessionId);
         if (change.type === "document" && typeof change.text === "string") {
           await mkdir(pinDirectory, { recursive: true });
-          await writePinFile(pinFilePath, change.text);
-          let openResult = change.openAfterSave === true
-            ? await withPinVisibleToNativeIndexer(() => (
-              openNativeFileTab(cdp, pinFilePath)
-            )).catch((error) => ({ ok: false, error: error.message }))
-            : null;
+          await writePinFile(canonicalPinFilePath, change.text);
+          let openResult = null;
+          let target = null;
+          if (change.openAfterSave === true) {
+            try {
+              target = await nativePinTarget(cdp, sessionId);
+              if (target.mirrored) await writePinFile(target.filePath, change.text);
+              openResult = await withPinVisibleToNativeIndexer(
+                target.filePath,
+                target.workspacePath,
+                () => openNativeFileTab(cdp, target.filePath),
+              );
+            } catch (error) {
+              openResult = {
+                ok: false,
+                error: target?.mirrored
+                  ? `无法在当前任务工作区创建或打开 Pin 镜像：${error.message}`
+                  : error.message,
+              };
+            }
+          }
           if (openResult && openResult.ok !== true) {
-            openResult = await explainNativeOpenFailure(cdp, openResult, pinFilePath);
+            openResult = await explainNativeOpenFailure(
+              cdp,
+              openResult,
+              target?.filePath || canonicalPinFilePath,
+            );
           }
           await postHostMessage(cdp, {
             type: "save-result",
             requestId: change.requestId,
             sessionId,
             ok: true,
-            fileName: path.basename(pinFilePath),
+            fileName: path.basename(canonicalPinFilePath),
             openResult,
           });
         } else if (change.type === "open") {
           let openResult;
           try {
-            await stat(pinFilePath);
+            await stat(canonicalPinFilePath);
+            const target = await nativePinTarget(cdp, sessionId);
+            if (target.mirrored) {
+              try {
+                await stat(target.filePath);
+              } catch (error) {
+                if (error.code !== "ENOENT") throw error;
+                await copyFile(canonicalPinFilePath, target.filePath);
+              }
+            }
             const requestedPoint = change.fileMenuPoint;
             const fileMenuPoint = requestedPoint && Number.isFinite(requestedPoint.x) && Number.isFinite(requestedPoint.y)
               ? { x: requestedPoint.x, y: requestedPoint.y }
               : null;
-            openResult = await withPinVisibleToNativeIndexer(() => (
-              openNativeFileTab(cdp, pinFilePath, { fileMenuPoint })
-            )).catch((error) => ({ ok: false, error: error.message }));
+            openResult = await withPinVisibleToNativeIndexer(
+              target.filePath,
+              target.workspacePath,
+              () => openNativeFileTab(cdp, target.filePath, { fileMenuPoint }),
+            ).catch((error) => ({ ok: false, error: error.message }));
             if (openResult.ok !== true) {
-              openResult = await explainNativeOpenFailure(cdp, openResult, pinFilePath);
+              openResult = await explainNativeOpenFailure(cdp, openResult, target.filePath);
             }
           } catch (error) {
             openResult = error.code === "ENOENT"
@@ -724,14 +838,14 @@ async function inject(browser, known) {
             requestId: change.requestId,
             sessionId,
             ok: openResult.ok === true,
-            fileName: path.basename(pinFilePath),
+            fileName: path.basename(canonicalPinFilePath),
             openResult,
           });
         } else if (change.type === "load") {
           try {
             const [text, info] = await Promise.all([
-              readFile(pinFilePath, "utf8"),
-              stat(pinFilePath),
+              readFile(canonicalPinFilePath, "utf8"),
+              stat(canonicalPinFilePath),
             ]);
             await postHostMessage(cdp, {
               type: "load-result",
@@ -741,7 +855,7 @@ async function inject(browser, known) {
               exists: true,
               text,
               modifiedAt: info.mtimeMs,
-              fileName: path.basename(pinFilePath),
+              fileName: path.basename(canonicalPinFilePath),
             });
           } catch (error) {
             if (error.code !== "ENOENT") throw error;
@@ -751,7 +865,7 @@ async function inject(browser, known) {
               sessionId,
               ok: true,
               exists: false,
-              fileName: path.basename(pinFilePath),
+              fileName: path.basename(canonicalPinFilePath),
             });
           }
         }

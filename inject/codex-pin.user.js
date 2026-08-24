@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const VERSION = "0.6.2"; // Fall back to Windows AUMID activation when direct Store app spawning is denied.
+  const VERSION = "0.6.3"; // Mirror Pin files into the active workspace for Codex native file search.
   const API_KEY = "__codexChatPinInjection__";
   const STYLE_ID = "codex-chat-pin-style";
   const BUTTON_ATTRIBUTE = "data-codex-chat-pin-button";
