@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { copyFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
@@ -14,11 +14,13 @@ const userScriptPath = path.join(root, "inject", "codex-pin.user.js");
 const pinDirectory = path.join(root, "pins");
 const legacyPinDirectory = path.join(root, "temp");
 const localGitExcludePath = path.join(root, ".git", "info", "exclude");
+const pinGitExcludeRule = "/pins/pin_*.md";
 const argv = process.argv.slice(2);
 const args = new Set(argv);
 const shouldLaunch = args.has("--launch");
 const shouldWatch = args.has("--watch");
 const writeQueues = new Map();
+let pinVisibilityQueue = Promise.resolve();
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 function optionValue(name) {
@@ -54,12 +56,11 @@ async function preparePinStorage() {
 
   if (existsSync(localGitExcludePath)) {
     try {
-      const rule = "/pins/pin_*.md";
       const current = await readFile(localGitExcludePath, "utf8");
       const rules = current.split(/\r?\n/).map((line) => line.trim());
-      if (!rules.includes(rule)) {
+      if (!rules.includes(pinGitExcludeRule)) {
         const separator = current && !current.endsWith("\n") ? "\n" : "";
-        await writeFile(localGitExcludePath, `${current}${separator}${rule}\n`, "utf8");
+        await writeFile(localGitExcludePath, `${current}${separator}${pinGitExcludeRule}\n`, "utf8");
       }
     } catch (error) {
       console.warn(`Chat Pin could not update .git/info/exclude: ${error.message}`);
@@ -82,6 +83,44 @@ async function preparePinStorage() {
 
 await preparePinStorage();
 
+async function withPinVisibleToNativeIndexer(action) {
+  const run = async () => {
+    let excludeRuleRemoved = false;
+    try {
+      if (existsSync(localGitExcludePath)) {
+        const current = await readFile(localGitExcludePath, "utf8");
+        const newline = current.includes("\r\n") ? "\r\n" : "\n";
+        const lines = current.split(/\r?\n/);
+        const filtered = lines.filter((line) => line.trim() !== pinGitExcludeRule);
+        if (filtered.length !== lines.length) {
+          await writeFile(localGitExcludePath, filtered.join(newline), "utf8");
+          excludeRuleRemoved = true;
+          // Codex maintains its own workspace file list. Give its watcher one
+          // short turn to observe the local exclude change before searching.
+          await delay(120);
+        }
+      }
+      return await action();
+    } finally {
+      if (excludeRuleRemoved) {
+        try {
+          const current = await readFile(localGitExcludePath, "utf8");
+          const rules = current.split(/\r?\n/).map((line) => line.trim());
+          if (!rules.includes(pinGitExcludeRule)) {
+            const separator = current && !current.endsWith("\n") ? "\n" : "";
+            await writeFile(localGitExcludePath, `${current}${separator}${pinGitExcludeRule}\n`, "utf8");
+          }
+        } catch (error) {
+          console.warn(`Chat Pin could not restore .git/info/exclude: ${error.message}`);
+        }
+      }
+    }
+  };
+  const pending = pinVisibilityQueue.then(run, run);
+  pinVisibilityQueue = pending.catch(() => {});
+  return pending;
+}
+
 async function postHostMessage(cdp, message) {
   const payload = JSON.stringify(message);
   await cdp.send("Runtime.evaluate", {
@@ -98,6 +137,50 @@ async function evaluateValue(cdp, expression) {
   });
   if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || "Codex renderer evaluation failed");
   return result.result?.value;
+}
+
+async function nativeWorkspaceContext(cdp) {
+  return evaluateValue(cdp, `(async () => {
+    let workspacePath = '';
+    try {
+      const url = new URL(location.href);
+      workspacePath = url.searchParams.get('workspace') || url.searchParams.get('cwd') || '';
+    } catch (_) {}
+    const thread = document.querySelector("[data-app-action-sidebar-thread-selected='true'],[data-app-action-sidebar-thread-active='true']");
+    const projectList = thread?.closest?.('[data-app-action-sidebar-project-list-id]');
+    const projectRow = thread?.closest?.('[data-app-action-sidebar-project-id]')
+      || document.querySelector('[data-app-action-sidebar-project-row][aria-current="page"]')
+      || document.querySelector('[data-app-action-sidebar-project-row][data-app-action-sidebar-project-active="true"]');
+    const projectId = projectList?.getAttribute('data-app-action-sidebar-project-list-id')
+      || projectRow?.getAttribute('data-app-action-sidebar-project-id')
+      || '';
+    if (!workspacePath) {
+      const bootstrap = await window.electronBridge?.getInitialSidebarBootstrap?.();
+      const entries = Array.isArray(bootstrap?.globalStateEntries) ? bootstrap.globalStateEntries : [];
+      const localProjects = entries.find((entry) => entry?.key === 'local-projects')?.value;
+      const roots = localProjects && typeof localProjects === 'object'
+        ? localProjects[projectId]?.rootPaths
+        : null;
+      workspacePath = Array.isArray(roots)
+        ? roots.find((value) => typeof value === 'string' && value.trim())?.trim() || ''
+        : '';
+    }
+    return { projectId, workspacePath };
+  })()`).catch(() => ({ projectId: "", workspacePath: "" }));
+}
+
+async function explainNativeOpenFailure(cdp, result, filePath) {
+  if (result?.ok === true) return result;
+  const context = await nativeWorkspaceContext(cdp);
+  const workspacePath = context?.workspacePath?.trim();
+  if (!workspacePath) return result;
+  const relative = path.relative(workspacePath, filePath);
+  const fileIsInWorkspace = relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  if (fileIsInWorkspace) return result;
+  return {
+    ...result,
+    error: `${result?.error || "原生文件打开失败"}；当前任务工作区是 ${workspacePath}，Pin 文件保存在 ${root}`,
+  };
 }
 
 async function waitForPoint(cdp, expression, timeoutMs, intervalMs = 40) {
@@ -525,9 +608,14 @@ async function inject(browser, known) {
         if (change.type === "document" && typeof change.text === "string") {
           await mkdir(pinDirectory, { recursive: true });
           await writePinFile(pinFilePath, change.text);
-          const openResult = change.openAfterSave === true
-            ? await openNativeFileTab(cdp, pinFilePath).catch((error) => ({ ok: false, error: error.message }))
+          let openResult = change.openAfterSave === true
+            ? await withPinVisibleToNativeIndexer(() => (
+              openNativeFileTab(cdp, pinFilePath)
+            )).catch((error) => ({ ok: false, error: error.message }))
             : null;
+          if (openResult && openResult.ok !== true) {
+            openResult = await explainNativeOpenFailure(cdp, openResult, pinFilePath);
+          }
           await postHostMessage(cdp, {
             type: "save-result",
             requestId: change.requestId,
@@ -544,7 +632,12 @@ async function inject(browser, known) {
             const fileMenuPoint = requestedPoint && Number.isFinite(requestedPoint.x) && Number.isFinite(requestedPoint.y)
               ? { x: requestedPoint.x, y: requestedPoint.y }
               : null;
-            openResult = await openNativeFileTab(cdp, pinFilePath, { fileMenuPoint }).catch((error) => ({ ok: false, error: error.message }));
+            openResult = await withPinVisibleToNativeIndexer(() => (
+              openNativeFileTab(cdp, pinFilePath, { fileMenuPoint })
+            )).catch((error) => ({ ok: false, error: error.message }));
+            if (openResult.ok !== true) {
+              openResult = await explainNativeOpenFailure(cdp, openResult, pinFilePath);
+            }
           } catch (error) {
             openResult = error.code === "ENOENT"
               ? { ok: false, error: "当前任务还没有 Pin 文件，请先 Pin 一条助手回复" }
@@ -623,6 +716,21 @@ let child = null;
 let browser = null;
 let rendererWasInjected = false;
 const known = new Map();
+
+function stopManagedCodex() {
+  if (!child?.pid || child.exitCode !== null) return;
+  if (process.platform === "win32") {
+    spawnSync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    return;
+  }
+  child.kill("SIGTERM");
+}
+
+process.once("exit", stopManagedCodex);
+
 try {
   if (!shouldLaunch) throw new Error("Existing Codex windows cannot be injected without CDP. Use: npm start");
   child = spawn(appPath, [
@@ -655,17 +763,19 @@ try {
     clearInterval(interval);
     for (const { cdp } of known.values()) cdp.close();
     browser?.close();
-    child?.kill();
+    stopManagedCodex();
     process.exit(0);
   };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
+  process.once("SIGHUP", stop);
+  if (process.platform === "win32") process.once("SIGBREAK", stop);
 } catch (error) {
   const message = error.message === "CDP pipe ended" && !rendererWasInjected
     ? "Chat Pin 已经在使用同一个独立 Codex 配置运行。请继续使用已打开的 Pin 窗口，或先关闭它再重新启动。"
     : error.message;
   console.error(`Chat Pin launcher: ${message}`);
   browser?.close();
-  child?.kill();
+  stopManagedCodex();
   process.exitCode = 1;
 }

@@ -8,6 +8,8 @@
 npm start
 ```
 
+Windows 也可以直接双击项目根目录的 `ChatGPT_Pin.cmd`，或使用安装到桌面/开始菜单的“Codex Chat Pin”快捷方式。启动脚本使用纯 ASCII 文件名和内容，以兼容不同 Windows 命令行代码页。快捷方式使用复制到项目 `assets/codex.ico` 的 Codex 官方应用图标。快捷方式仍会显示启动终端；保持终端运行，关闭它即可停止专用 Pin 实例。
+
 启动器会打开一个使用项目内独立配置目录的 Codex 窗口，并通过私有 CDP 管道注入界面。首次使用该独立窗口时，可能需要在窗口中自行登录。保持启动器窗口运行；关闭启动器会停止其管理的 Codex 窗口。
 
 启动器参照 Codex Taskboard 的桌面端启动方式定位官方应用：Windows 查找 Microsoft Store 包内的 `app\\ChatGPT.exe`，macOS 依次查找 `/Applications` 和 `~/Applications` 下的 `ChatGPT.app`、`Codex.app`，然后直接向桌面端传递独立 profile 与私有 CDP pipe 参数。`resources\\codex.exe`（macOS 中为 `Contents/Resources/codex`）是 CLI，不用于启动桌面界面。
@@ -32,7 +34,7 @@ node scripts/pin-launcher.mjs --launch --watch --app-path "/custom/Codex.app"
 - 原生文件 Tab 会固定在侧栏顶部；再次 Pin 同一会话时优先复用同名 Tab，避免新增重复页签。
 - 精确文件名筛选会优先点击原生第一结果；仅在快速路径失败时进入慢索引兼容流程，成功提示会显示本次原生打开耗时。
 - Pin 按会话隔离，写入项目下的 `pins/pin_<会话ID>.md`。无法取得可靠会话 ID 时使用稳定路由摘要；取消置顶不会删除对应文件。
-- 启动器会将 `pins/pin_*.md` 写入本机 `.git/info/exclude`，避免 Pin 内容进入 Git；仓库 `.ignore` 再将这些文件暴露给 ripgrep/Codex 文件筛选器。旧版 `temp/pin_*.md` 会自动迁移。
+- 启动器会将 `pins/pin_*.md` 写入本机 `.git/info/exclude`，避免 Pin 内容进入 Git；仓库 `.ignore` 将文件暴露给命令行 ripgrep。由于 Codex 原生文件索引与 ripgrep 的 ignore 优先级并不完全一致，打开 Pin 时会短暂移除本地排除规则，待原生打开流程结束后立即恢复。旧版 `temp/pin_*.md` 会自动迁移。
 - 标题、段落、粗体、斜体、删除线、引用、列表、代码块、链接、图片和表格会转换为 Markdown；复杂的自定义渲染仍可能降级为文本。
 - 写盘或原生打开失败会显示短暂错误提示，不会遮挡或替换 Codex 的聊天界面。
 - 本版本不注入独立 Pin 页面；菜单中的“打开 Pin 文件”只是打开原生 Markdown 文件，不会创建自定义页面。
