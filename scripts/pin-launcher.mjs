@@ -1,10 +1,11 @@
 #!/usr/bin/env node
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { copyFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveCodexDesktop } from "./codex-app.mjs";
 import { CdpPipeBrowser } from "./cdp-pipe.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -13,30 +14,23 @@ const userScriptPath = path.join(root, "inject", "codex-pin.user.js");
 const pinDirectory = path.join(root, "pins");
 const legacyPinDirectory = path.join(root, "temp");
 const localGitExcludePath = path.join(root, ".git", "info", "exclude");
-const args = new Set(process.argv.slice(2));
+const argv = process.argv.slice(2);
+const args = new Set(argv);
 const shouldLaunch = args.has("--launch");
 const shouldWatch = args.has("--watch");
 const writeQueues = new Map();
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
-if (process.platform !== "win32") throw new Error("This launcher currently targets Windows Codex Desktop only.");
-
-function resolveCodexApp() {
-  const result = spawnSync("powershell.exe", [
-    "-NoProfile",
-    "-NonInteractive",
-    "-Command",
-    "(Get-AppxPackage -Name OpenAI.Codex | Select-Object -First 1 -ExpandProperty InstallLocation).Trim()",
-  ], { encoding: "utf8", windowsHide: true });
-  const installLocation = result.status === 0 ? result.stdout.trim() : "";
-  const candidate = installLocation && path.join(installLocation, "app", "ChatGPT.exe");
-  if (!candidate || !existsSync(candidate)) {
-    throw new Error("Microsoft Store 版 Codex 未找到。请先安装或更新 OpenAI.Codex。");
-  }
-  return candidate;
+function optionValue(name) {
+  const index = argv.indexOf(name);
+  if (index === -1) return undefined;
+  const value = argv[index + 1];
+  if (!value || value.startsWith("--")) throw new Error(`${name} 需要一个路径参数。`);
+  return value;
 }
 
-const appPath = resolveCodexApp();
+const codexDesktop = resolveCodexDesktop({ explicitPath: optionValue("--app-path") });
+const appPath = codexDesktop.executablePath;
 
 function isCodexRenderer(target) {
   return target.type === "page"
@@ -634,9 +628,20 @@ try {
   child = spawn(appPath, [
     `--user-data-dir=${profilePath}`,
     "--remote-debugging-pipe",
-  ], { stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"], windowsHide: false });
+  ], {
+    stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"],
+    windowsHide: false,
+  });
   browser = new CdpPipeBrowser(child);
-  await browser.open();
+  const launchFailure = new Promise((_, reject) => {
+    child.once("error", (error) => {
+      const hint = error.code === "EPERM" && process.platform === "win32"
+        ? "；当前启动的是 app\\ChatGPT.exe，而不是 resources\\codex.exe。请确认当前账户可启动 Microsoft Store Codex，或用 --app-path 指定可执行文件"
+        : "";
+      reject(new Error(`无法启动 Codex Desktop (${error.code || error.message})${hint}`));
+    });
+  });
+  await Promise.race([browser.open(), launchFailure]);
   const deadline = Date.now() + 45_000;
   while (Date.now() < deadline && known.size === 0) {
     await inject(browser, known);

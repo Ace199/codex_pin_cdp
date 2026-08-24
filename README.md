@@ -1,6 +1,6 @@
 # Chat Pin for Codex Desktop
 
-这是一个针对 Windows Microsoft Store 版 Codex 的本地 UI 注入器。它不修改 Codex 安装包，也不读取或复制 Cookie、登录数据或聊天数据库。
+这是一个针对 Windows 和 macOS Codex Desktop 的本地 UI 注入器。它不修改 Codex 安装包，也不读取或复制 Cookie、登录数据或聊天数据库。
 
 ## 启动
 
@@ -9,6 +9,20 @@ npm start
 ```
 
 启动器会打开一个使用项目内独立配置目录的 Codex 窗口，并通过私有 CDP 管道注入界面。首次使用该独立窗口时，可能需要在窗口中自行登录。保持启动器窗口运行；关闭启动器会停止其管理的 Codex 窗口。
+
+启动器参照 Codex Taskboard 的桌面端启动方式定位官方应用：Windows 查找 Microsoft Store 包内的 `app\\ChatGPT.exe`，macOS 依次查找 `/Applications` 和 `~/Applications` 下的 `ChatGPT.app`、`Codex.app`，然后直接向桌面端传递独立 profile 与私有 CDP pipe 参数。`resources\\codex.exe`（macOS 中为 `Contents/Resources/codex`）是 CLI，不用于启动桌面界面。
+
+应用安装在非默认位置时可显式指定。macOS 可传 `.app` 路径或内部可执行文件；Windows 传桌面端 `ChatGPT.exe`：
+
+```powershell
+node scripts/pin-launcher.mjs --launch --watch --app-path "C:\\path\\to\\ChatGPT.exe"
+```
+
+```bash
+node scripts/pin-launcher.mjs --launch --watch --app-path "/custom/Codex.app"
+```
+
+也可以使用环境变量 `CODEX_PIN_APP_PATH`。`explorer.exe shell:AppsFolder\\<AUMID>` 适合普通启动，但不能建立本项目所需、绑定到当前 Node 进程的私有 CDP pipe，因此不作为注入启动路径。
 
 ## 当前功能
 

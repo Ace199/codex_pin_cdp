@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const VERSION = "0.5.8"; // Use the exact-search result as the native file opening fast path.
+  const VERSION = "0.6.0"; // Cross-platform Codex Desktop launcher support.
   const API_KEY = "__codexChatPinInjection__";
   const STYLE_ID = "codex-chat-pin-style";
   const BUTTON_ATTRIBUTE = "data-codex-chat-pin-button";
