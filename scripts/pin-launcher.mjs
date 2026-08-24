@@ -519,8 +519,17 @@ async function openNativeFileTab(cdp, filePath, options = {}) {
             return rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth;
           };
           const button = [...document.querySelectorAll('button')].filter((node) => {
-            const label = [node.title, node.getAttribute('aria-label')].filter(Boolean).join(' ');
-            return visible(node) && /显示.{0,3}隐藏侧边面板|切换侧边面板|show.{0,4}hide side panel|toggle side panel/i.test(label);
+            const describedBy = (node.getAttribute('aria-describedby') || '').split(/\s+/)
+              .map((id) => document.getElementById(id)?.textContent || '')
+              .join(' ');
+            const label = [
+              node.title,
+              node.getAttribute('aria-label'),
+              node.getAttribute('data-tooltip-content'),
+              describedBy,
+              node.textContent,
+            ].filter(Boolean).join(' ');
+            return visible(node) && /显示.{0,5}隐藏.{0,4}(?:侧边|辅助)面板|切换.{0,4}(?:侧边|辅助)面板|show.{0,6}hide.{0,6}(?:side|secondary).{0,4}(?:panel|bar)|toggle.{0,8}(?:side|secondary).{0,4}(?:panel|bar)/i.test(label);
           }).sort((left, right) => right.getBoundingClientRect().right - left.getBoundingClientRect().right)[0];
           if (!button) return null;
           const rect = button.getBoundingClientRect();
@@ -532,11 +541,25 @@ async function openNativeFileTab(cdp, filePath, options = {}) {
     let fileMenuPoint = await evaluateValue(cdp, fileMenuPointExpression());
     let addTabPoint = null;
     let toggleState = null;
+    let sidePanelShortcutUsed = false;
     if (!fileMenuPoint) {
       toggleState = await evaluateValue(cdp, togglePointExpression);
       if (toggleState && !toggleState.open) {
         await clickPoint(cdp, toggleState);
         fileMenuPoint = await waitForStablePoint(cdp, fileMenuPointExpression(), 1_500);
+      } else if (!toggleState) {
+        // Some Codex builds render the side-panel toggle as an icon without an
+        // accessible name until hover. Use the app's native shortcut instead
+        // of relying on its unstable button DOM.
+        await pressKey(cdp, {
+          key: "b",
+          code: "KeyB",
+          windowsVirtualKeyCode: 66,
+          modifiers: process.platform === "darwin" ? 5 : 3,
+        });
+        sidePanelShortcutUsed = true;
+        fileMenuPoint = await waitForStablePoint(cdp, fileMenuPointExpression(), 1_800);
+        if (!fileMenuPoint) addTabPoint = await waitForPoint(cdp, addTabExpression, 1_000);
       }
     }
     for (let attempt = 0; attempt < 24 && !fileMenuPoint && !addTabPoint; attempt += 1) {
@@ -547,7 +570,14 @@ async function openNativeFileTab(cdp, filePath, options = {}) {
 
     if (!fileMenuPoint && !addTabPoint) {
       toggleState = await evaluateValue(cdp, togglePointExpression);
-      if (!toggleState) return { ok: false, error: "未找到 Codex 原生侧栏开关" };
+      if (!toggleState) {
+        return {
+          ok: false,
+          error: sidePanelShortcutUsed
+            ? "已触发 Codex 原生侧栏快捷键，但右侧入口未出现"
+            : "未找到 Codex 原生侧栏开关",
+        };
+      }
       if (toggleState.open) return { ok: false, error: "Codex 原生侧栏已展开，但未找到新增页入口" };
       await clickPoint(cdp, toggleState);
       for (let attempt = 0; attempt < 20 && !fileMenuPoint && !addTabPoint; attempt += 1) {

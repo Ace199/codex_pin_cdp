@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const VERSION = "0.6.4"; // Keep native-search mirrors in each workspace's pins directory.
+  const VERSION = "0.6.6"; // Preserve Codex code blocks without copying their language-toolbar labels.
   const API_KEY = "__codexChatPinInjection__";
   const STYLE_ID = "codex-chat-pin-style";
   const BUTTON_ATTRIBUTE = "data-codex-chat-pin-button";
@@ -203,6 +203,104 @@
     return [header, header.map(() => "---"), ...normalized.slice(1)].map((row) => `| ${row.join(" | ")} |`).join("\n");
   }
 
+  function normalizedCodeLanguage(...values) {
+    const aliases = new Map([
+      ["py", "python"],
+      ["python", "python"],
+      ["js", "javascript"],
+      ["javascript", "javascript"],
+      ["jsx", "jsx"],
+      ["ts", "typescript"],
+      ["typescript", "typescript"],
+      ["tsx", "tsx"],
+      ["sh", "bash"],
+      ["shell", "bash"],
+      ["bash", "bash"],
+      ["powershell", "powershell"],
+      ["ps1", "powershell"],
+      ["纯文本", ""],
+      ["纯文字", ""],
+      ["plaintext", ""],
+      ["plain text", ""],
+      ["text", ""],
+      ["text/plain", ""],
+    ]);
+    for (const value of values) {
+      let candidate = String(value || "").replace(/复制(?:代码)?|copy(?: code)?/gi, "").trim().toLowerCase();
+      if (!candidate) continue;
+      const classLanguage = candidate.match(/(?:^|\s)language-([\w.+#-]+)/)?.[1];
+      if (classLanguage) candidate = classLanguage;
+      if (aliases.has(candidate)) return aliases.get(candidate);
+      if (/^[a-z0-9][\w.+#-]{0,23}$/i.test(candidate)) return candidate;
+    }
+    return "";
+  }
+
+  function codeLanguage(code, fallback = "") {
+    const owner = code.closest?.("[data-language],[data-lang],[data-code-language]");
+    return normalizedCodeLanguage(
+      code.getAttribute?.("data-codex-pin-language"),
+      code.getAttribute?.("data-language"),
+      code.getAttribute?.("data-lang"),
+      code.getAttribute?.("data-code-language"),
+      code.className,
+      owner?.getAttribute?.("data-language"),
+      owner?.getAttribute?.("data-lang"),
+      owner?.getAttribute?.("data-code-language"),
+      fallback,
+    );
+  }
+
+  function fencedCode(value, language = "") {
+    const code = String(value || "").replace(/^\n|\n$/g, "");
+    const longestTicks = Math.max(0, ...(code.match(/`+/g) || []).map((run) => run.length));
+    const fence = "`".repeat(Math.max(3, longestTicks + 1));
+    return `\n${fence}${language}\n${code}\n${fence}\n\n`;
+  }
+
+  function prepareCodeBlocks(rootNode) {
+    for (const code of rootNode.querySelectorAll("code")) {
+      const value = code.textContent || "";
+      let copyButton = null;
+      let blockContainer = null;
+      for (let parent = code.parentElement, depth = 0; parent && parent !== rootNode.parentElement && depth < 7; parent = parent.parentElement, depth += 1) {
+        if (parent === rootNode || parent.matches?.("[data-message-content],[data-response-annotation-target],[data-local-conversation-final-assistant='true']")) break;
+        const parentText = parent.textContent || "";
+        const surroundingText = parentText.includes(value) ? parentText.replace(value, "").trim() : parentText.trim();
+        const candidate = [...parent.querySelectorAll("button")].find((button) => {
+          const label = [button.textContent, button.title, button.getAttribute("aria-label")].filter(Boolean).join(" ");
+          const specificallyCode = /复制代码|copy code/i.test(label);
+          const genericCopy = /^(?:复制|copy)$/i.test(label.trim());
+          return specificallyCode || (genericCopy && surroundingText.length <= 60);
+        });
+        if (candidate) {
+          copyButton = candidate;
+          blockContainer = parent;
+          break;
+        }
+        if (parent.tagName === "PRE") blockContainer ||= parent;
+      }
+      const isBlock = Boolean(code.closest("pre") || copyButton || value.includes("\n"));
+      if (!isBlock) continue;
+
+      const chromeText = copyButton && blockContainer
+        ? (blockContainer.innerText || blockContainer.textContent || "").replace(value, "")
+        : "";
+      code.setAttribute("data-codex-pin-block", "true");
+      code.setAttribute("data-codex-pin-language", codeLanguage(code, chromeText));
+
+      if (copyButton) {
+        let chrome = copyButton;
+        for (let parent = copyButton.parentElement; parent && parent !== blockContainer; parent = parent.parentElement) {
+          if (parent.contains(code)) break;
+          chrome = parent;
+        }
+        if (chrome !== blockContainer && !chrome.contains(code)) chrome.remove();
+        else copyButton.remove();
+      }
+    }
+  }
+
   function markdownFrom(node) {
     const walkChildren = (parent) => [...parent.childNodes].map(walk).join("");
     const walk = (current) => {
@@ -211,14 +309,16 @@
       const tag = current.tagName;
       if (tag === "BR") return "\n";
       if (tag === "PRE") {
-        const code = (current.textContent || "").replace(/\n$/, "");
-        const language = current.querySelector("code")?.className?.match(/language-([\w-]+)/)?.[1] || "";
-        const ticks = code.includes("```") ? "````" : "```";
-        return `\n${ticks}${language}\n${code}\n${ticks}\n\n`;
+        const codeNode = current.querySelector("code");
+        return fencedCode(codeNode?.textContent ?? current.textContent ?? "", codeNode ? codeLanguage(codeNode) : "");
       }
       if (tag === "CODE") {
         const value = current.textContent || "";
-        const fence = value.includes("`") ? "``" : "`";
+        if (current.getAttribute("data-codex-pin-block") === "true" || value.includes("\n")) {
+          return fencedCode(value, codeLanguage(current));
+        }
+        const longestTicks = Math.max(0, ...(value.match(/`+/g) || []).map((run) => run.length));
+        const fence = "`".repeat(longestTicks + 1);
         return `${fence}${value}${fence}`;
       }
       if (/^H[1-6]$/.test(tag)) return `${"#".repeat(Number(tag[1]))} ${walkChildren(current).trim()}\n\n`;
@@ -249,6 +349,7 @@
     const cached = contentCache.get(messageNode);
     if (cached?.raw === raw) return cached.value;
     const clone = messageNode.cloneNode(true);
+    prepareCodeBlocks(clone);
     clone.querySelectorAll(".sr-only,[data-assistant-message-sent-time]").forEach((node) => node.remove());
     clone.querySelectorAll(`button,input,textarea,script,style,[${BUTTON_ATTRIBUTE}]`).forEach((node) => node.remove());
     const specific = [...clone.querySelectorAll("[data-message-content]")]
