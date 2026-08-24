@@ -5,4 +5,5 @@ node_modules/
 
 # Local development context; not part of the distributable project.
 AGENTS.md
+docs/POSTMORTEM_AND_REGRESSION_RULES.md
 reference/

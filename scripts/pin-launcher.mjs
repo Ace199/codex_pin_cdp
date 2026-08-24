@@ -9,6 +9,15 @@ import { fileURLToPath } from "node:url";
 import { resolveCodexDesktop } from "./codex-app.mjs";
 import { CdpPipeBrowser } from "./cdp-pipe.mjs";
 import { CdpWebSocketBrowser } from "./cdp-websocket.mjs";
+import {
+  composerHasRevisionMessage,
+  contentHash,
+  REVISION_MARKER,
+  revisionInstruction,
+  revisionMessage,
+  withoutRevisionInstruction,
+  workspaceRelativeFile,
+} from "./revision-mode.mjs";
 import { activateWindowsApp } from "./windows-app-activation.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -18,6 +27,7 @@ const profilePath = process.env.CODEX_PIN_PROFILE
 const userScriptPath = path.join(root, "inject", "codex-pin.user.js");
 const pinDirectory = path.join(root, "pins");
 const legacyPinDirectory = path.join(root, "temp");
+const revisionHistoryDirectory = path.join(profilePath, "revision-history");
 const localGitExcludePath = path.join(root, ".git", "info", "exclude");
 const pinGitExcludeRule = "/pins/pin_*.md";
 const argv = process.argv.slice(2);
@@ -26,6 +36,7 @@ const shouldLaunch = args.has("--launch");
 const shouldWatch = args.has("--watch");
 const forceWindowsActivation = args.has("--windows-activation");
 const writeQueues = new Map();
+const revisionStates = new Map();
 let pinVisibilityQueue = Promise.resolve();
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -256,6 +267,144 @@ async function nativeWorkspaceContext(cdp) {
   })()`).catch(() => ({ projectId: "", workspacePath: "" }));
 }
 
+async function composerSnapshot(cdp) {
+  return evaluateValue(cdp, `(() => {
+    const root = Array.from(document.querySelectorAll(
+      '[data-codex-composer-root][data-composer-placement="thread"]'
+    )).find((candidate) => candidate.getClientRects().length > 0);
+    const editor = Array.from(root?.querySelectorAll(
+      '[data-codex-composer="true"][contenteditable="true"], [contenteditable="true"][role="textbox"], textarea'
+    ) || []).find((candidate) => candidate.getClientRects().length > 0);
+    if (!editor) return { ready: false, text: '' };
+    return { ready: true, text: editor instanceof HTMLTextAreaElement ? editor.value : editor.innerText || '' };
+  })()`);
+}
+
+async function selectComposerContents(cdp, collapseToEnd) {
+  return evaluateValue(cdp, `(() => {
+    const root = Array.from(document.querySelectorAll(
+      '[data-codex-composer-root][data-composer-placement="thread"]'
+    )).find((candidate) => candidate.getClientRects().length > 0);
+    const editor = Array.from(root?.querySelectorAll(
+      '[data-codex-composer="true"][contenteditable="true"], [contenteditable="true"][role="textbox"], textarea'
+    ) || []).find((candidate) => candidate.getClientRects().length > 0);
+    if (!editor) return false;
+    editor.focus();
+    if (editor instanceof HTMLTextAreaElement) {
+      const offset = ${collapseToEnd ? "editor.value.length" : "0"};
+      editor.setSelectionRange(${collapseToEnd ? "offset" : "0"}, ${collapseToEnd ? "offset" : "editor.value.length"});
+      return true;
+    }
+    const selection = getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(editor);
+    if (${collapseToEnd ? "true" : "false"}) range.collapse(false);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    return true;
+  })()`);
+}
+
+async function replaceComposerText(cdp, text) {
+  if (!await selectComposerContents(cdp, false)) return false;
+  await cdp.send("Input.insertText", { text });
+  return true;
+}
+
+async function replaceComposerTextWithShortcut(cdp, text) {
+  const focused = await selectComposerContents(cdp, true);
+  if (!focused) return false;
+  const modifiers = process.platform === "darwin" ? 4 : 2;
+  await cdp.send("Input.dispatchKeyEvent", {
+    type: "rawKeyDown",
+    key: "a",
+    code: "KeyA",
+    windowsVirtualKeyCode: 65,
+    nativeVirtualKeyCode: 65,
+    modifiers,
+  });
+  await cdp.send("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "a",
+    code: "KeyA",
+    windowsVirtualKeyCode: 65,
+    nativeVirtualKeyCode: 65,
+    modifiers,
+  });
+  await cdp.send("Input.insertText", { text });
+  return true;
+}
+
+async function waitForRevisionComposer(cdp, userInput, combinedMessage) {
+  for (let attempt = 0; attempt < 24; attempt += 1) {
+    const current = await composerSnapshot(cdp);
+    if (current.ready && composerHasRevisionMessage(current.text, userInput, combinedMessage)) return true;
+    await delay(25);
+  }
+  return false;
+}
+
+async function prepareRevisionComposer(cdp, userInput, combinedMessage) {
+  const before = await composerSnapshot(cdp);
+  if (!before.ready) return { prepared: false, error: "Codex 输入框尚未出现" };
+  const expected = String(userInput || "").trim();
+  if (!expected) return { prepared: false, error: "请输入本次文档修改要求" };
+  if (before.text.trim() !== expected) {
+    return { prepared: false, error: "发送前输入内容发生了变化，请重新发送" };
+  }
+  const combined = String(combinedMessage || "");
+  try {
+    const masked = await evaluateValue(cdp, `(() => {
+      const root = Array.from(document.querySelectorAll(
+        '[data-codex-composer-root][data-composer-placement="thread"]'
+      )).find((candidate) => candidate.getClientRects().length > 0);
+      if (!root) return false;
+      root.setAttribute('data-codex-chat-pin-submitting', 'true');
+      return true;
+    })()`);
+    if (!masked) return { prepared: false, error: "Codex 输入区域尚未出现" };
+    if (!await replaceComposerText(cdp, combined)) {
+      throw new Error("无法聚焦 Codex 输入框");
+    }
+    if (await waitForRevisionComposer(cdp, expected, combined)) {
+      return { prepared: true, method: "selection" };
+    }
+    if (!await replaceComposerTextWithShortcut(cdp, combined)) {
+      throw new Error("无法通过 Codex 输入事件更新修订要求");
+    }
+    if (await waitForRevisionComposer(cdp, expected, combined)) {
+      return { prepared: true, method: "shortcut" };
+    }
+    throw new Error("修订约束没有进入 Codex 发送状态");
+  } catch (error) {
+    await replaceComposerText(cdp, expected).catch(() => false);
+    await unmaskRevisionComposer(cdp);
+    return { prepared: false, error: error.message || "无法附加修订约束" };
+  }
+}
+
+async function unmaskRevisionComposer(cdp) {
+  await evaluateValue(cdp, `(() => {
+    document.querySelectorAll('[data-codex-chat-pin-submitting="true"]')
+      .forEach((node) => node.removeAttribute('data-codex-chat-pin-submitting'));
+    return true;
+  })()`).catch(() => {});
+}
+
+async function cleanRevisionComposer(cdp) {
+  const before = await composerSnapshot(cdp);
+  if (!before.ready || !before.text.includes(REVISION_MARKER)) return { cleaned: true, changed: false };
+  const cleanedText = withoutRevisionInstruction(before.text);
+  if (!await selectComposerContents(cdp, false)) return { cleaned: false, error: "无法聚焦 Codex 输入框" };
+  await cdp.send("Input.insertText", { text: cleanedText });
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const current = await composerSnapshot(cdp);
+    if (!current.text.includes(REVISION_MARKER)) return { cleaned: true, changed: true };
+    await delay(40);
+  }
+  return { cleaned: false, error: "无法从 Codex 输入框移除修订指令" };
+}
+
 async function explainNativeOpenFailure(cdp, result, filePath) {
   if (result?.ok === true) return result;
   const context = await nativeWorkspaceContext(cdp);
@@ -297,6 +446,158 @@ async function nativePinTarget(cdp, sessionId) {
     filePath: path.join(workspacePath, "pins", path.basename(canonicalPath)),
     workspacePath,
     mirrored: true,
+  };
+}
+
+async function revisionTarget(cdp, sessionId) {
+  const context = await nativeWorkspaceContext(cdp);
+  const candidate = context?.workspacePath?.trim();
+  if (!candidate || !path.isAbsolute(candidate)) {
+    throw new Error("当前任务没有可确认的本地工作区，不能启用修订模式");
+  }
+  const workspacePath = path.resolve(candidate);
+  const workspaceInfo = await stat(workspacePath).catch(() => null);
+  if (!workspaceInfo?.isDirectory()) throw new Error("当前任务的工作区路径不可访问");
+
+  const canonicalPath = pinFileFor(sessionId);
+  await stat(canonicalPath).catch((error) => {
+    if (error.code === "ENOENT") throw new Error("当前任务还没有 Pin 文件，请先 Pin 一条助手回复");
+    throw error;
+  });
+
+  const mirrored = !samePath(workspacePath, root);
+  const filePath = mirrored
+    ? path.join(workspacePath, "pins", path.basename(canonicalPath))
+    : canonicalPath;
+  if (mirrored) {
+    await mkdir(path.dirname(filePath), { recursive: true });
+    try {
+      await stat(filePath);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      await copyFile(canonicalPath, filePath);
+    }
+  }
+
+  const relativePath = workspaceRelativeFile(filePath, workspacePath);
+  if (!relativePath) throw new Error("Pin 文件不在当前任务工作区内，不能启用修订模式");
+  return { canonicalPath, filePath, workspacePath, relativePath, mirrored };
+}
+
+async function syncRevisionTarget(state) {
+  const text = await readFile(state.target.filePath, "utf8");
+  if (state.target.mirrored) await writePinFile(state.target.canonicalPath, text);
+  state.lastKnownHash = contentHash(text);
+  return { text, hash: state.lastKnownHash };
+}
+
+function revisionStatePayload(state) {
+  if (!state) return { enabled: false };
+  return {
+    enabled: true,
+    sessionId: state.sessionId,
+    fileName: path.basename(state.target.canonicalPath),
+    relativePath: state.target.relativePath,
+    instruction: revisionInstruction(state.target.relativePath),
+    enabledAt: state.enabledAt,
+  };
+}
+
+async function enableRevision(cdp, stateKey, sessionId) {
+  const existing = revisionStates.get(stateKey);
+  if (existing && existing.sessionId !== sessionId) {
+    await syncRevisionTarget(existing).catch(() => {});
+    revisionStates.delete(stateKey);
+  }
+  const target = await revisionTarget(cdp, sessionId);
+  const text = await readFile(target.filePath, "utf8");
+  if (target.mirrored) await writePinFile(target.canonicalPath, text);
+  const state = {
+    cdp,
+    sessionId,
+    target,
+    enabledAt: Date.now(),
+    lastKnownHash: contentHash(text),
+    turns: new Map(),
+  };
+  revisionStates.set(stateKey, state);
+  const composer = await cleanRevisionComposer(cdp);
+  return { ...revisionStatePayload(state), composer };
+}
+
+async function disableRevision(stateKey, sessionId) {
+  const state = revisionStates.get(stateKey);
+  if (!state || state.sessionId !== sessionId) return { enabled: false };
+  const composer = await cleanRevisionComposer(state.cdp);
+  if (!composer.cleaned) throw new Error(composer.error || "无法清理输入框中的修订指令");
+  await syncRevisionTarget(state);
+  revisionStates.delete(stateKey);
+  return { enabled: false };
+}
+
+async function currentRevisionState(cdp, stateKey, sessionId) {
+  const state = revisionStates.get(stateKey);
+  if (!state) return { enabled: false };
+  if (state.sessionId !== sessionId) {
+    await syncRevisionTarget(state).catch(() => {});
+    revisionStates.delete(stateKey);
+    return { enabled: false };
+  }
+  await stat(state.target.filePath).catch(() => {
+    revisionStates.delete(stateKey);
+    throw new Error("修订目标文件已经不存在，修订模式已关闭");
+  });
+  state.cdp = cdp;
+  return revisionStatePayload(state);
+}
+
+async function beginRevisionTurn(cdp, stateKey, sessionId, turnId, userInput) {
+  const state = revisionStates.get(stateKey);
+  if (!state || state.sessionId !== sessionId) throw new Error("当前任务没有启用修订模式");
+  state.cdp = cdp;
+  const currentTarget = await revisionTarget(cdp, sessionId);
+  if (!samePath(currentTarget.filePath, state.target.filePath)
+    || !samePath(currentTarget.workspacePath, state.target.workspacePath)) {
+    throw new Error("当前任务工作区已经变化，请重新启用修订模式");
+  }
+  const instruction = revisionInstruction(state.target.relativePath);
+  const message = revisionMessage(userInput, state.target.relativePath);
+  const text = await readFile(state.target.filePath, "utf8");
+  const baselineHash = contentHash(text);
+  const historyDirectory = path.join(revisionHistoryDirectory, safeSessionId(sessionId));
+  await mkdir(historyDirectory, { recursive: true });
+  const backupPath = path.join(historyDirectory, `${Date.now()}_${baselineHash.slice(0, 12)}.md`);
+  await writeFile(backupPath, text, { encoding: "utf8", flush: true });
+  const composer = await prepareRevisionComposer(cdp, userInput, message);
+  if (!composer.prepared) {
+    await unmaskRevisionComposer(cdp);
+    throw new Error(composer.error || "无法附加修订约束");
+  }
+  state.turns.set(turnId, { baselineHash, backupPath, startedAt: Date.now() });
+  return {
+    ...revisionStatePayload(state),
+    turnId,
+    baselineHash,
+    instruction,
+    messageLength: message.length,
+    composer,
+  };
+}
+
+async function finishRevisionTurn(stateKey, sessionId, turnId) {
+  const state = revisionStates.get(stateKey);
+  if (!state || state.sessionId !== sessionId) throw new Error("修订模式已经关闭，无法核验本轮修改");
+  const turn = state.turns.get(turnId);
+  if (!turn) throw new Error("没有找到本轮修订事务");
+  state.turns.delete(turnId);
+  const current = await syncRevisionTarget(state);
+  return {
+    ...revisionStatePayload(state),
+    turnId,
+    changed: current.hash !== turn.baselineHash,
+    baselineHash: turn.baselineHash,
+    currentHash: current.hash,
+    backupPath: turn.backupPath,
   };
 }
 
@@ -830,27 +1131,64 @@ async function inject(browser, known) {
         if (!change || typeof change !== "object") return;
         const sessionId = safeSessionId(change.sessionId);
         const canonicalPinFilePath = pinFileFor(sessionId);
-        if (change.type === "document" && typeof change.text === "string") {
+        const revisionAction = typeof change.type === "string" && change.type.startsWith("revision-")
+          ? change.type.slice("revision-".length)
+          : "";
+        if (revisionAction) {
+          let state;
+          if (revisionAction === "enable") {
+            state = await enableRevision(cdp, target.targetId, sessionId);
+          } else if (revisionAction === "disable") {
+            state = await disableRevision(target.targetId, sessionId);
+          } else if (revisionAction === "status") {
+            state = await currentRevisionState(cdp, target.targetId, sessionId);
+          } else if (revisionAction === "turn-start") {
+            state = await beginRevisionTurn(
+              cdp,
+              target.targetId,
+              sessionId,
+              String(change.turnId || change.requestId),
+              String(change.input || ""),
+            );
+          } else if (revisionAction === "turn-finish") {
+            state = await finishRevisionTurn(target.targetId, sessionId, String(change.turnId || ""));
+          } else if (revisionAction === "cleanup") {
+            state = { enabled: false, composer: await cleanRevisionComposer(cdp) };
+          } else {
+            throw new Error(`未知修订操作：${revisionAction}`);
+          }
+          await postHostMessage(cdp, {
+            type: "revision-result",
+            action: revisionAction,
+            requestId: change.requestId,
+            sessionId,
+            ok: true,
+            state,
+          });
+        } else if (change.type === "document" && typeof change.text === "string") {
+          const activeRevision = revisionStates.get(target.targetId);
+          const revisionDisabled = activeRevision?.sessionId === sessionId;
+          if (revisionDisabled) revisionStates.delete(target.targetId);
           await mkdir(pinDirectory, { recursive: true });
           await writePinFile(canonicalPinFilePath, change.text);
           let openResult = null;
-          let target = null;
+          let pinTarget = null;
           if (change.openAfterSave === true) {
             try {
-              target = await nativePinTarget(cdp, sessionId);
-              if (target.mirrored) {
-                await mkdir(path.dirname(target.filePath), { recursive: true });
-                await writePinFile(target.filePath, change.text);
+              pinTarget = await nativePinTarget(cdp, sessionId);
+              if (pinTarget.mirrored) {
+                await mkdir(path.dirname(pinTarget.filePath), { recursive: true });
+                await writePinFile(pinTarget.filePath, change.text);
               }
               openResult = await withPinVisibleToNativeIndexer(
-                target.filePath,
-                target.workspacePath,
-                () => openNativeFileTab(cdp, target.filePath),
+                pinTarget.filePath,
+                pinTarget.workspacePath,
+                () => openNativeFileTab(cdp, pinTarget.filePath),
               );
             } catch (error) {
               openResult = {
                 ok: false,
-                error: target?.mirrored
+                error: pinTarget?.mirrored
                   ? `无法在当前任务工作区创建或打开 Pin 镜像：${error.message}`
                   : error.message,
               };
@@ -860,7 +1198,7 @@ async function inject(browser, known) {
             openResult = await explainNativeOpenFailure(
               cdp,
               openResult,
-              target?.filePath || canonicalPinFilePath,
+              pinTarget?.filePath || canonicalPinFilePath,
             );
           }
           await postHostMessage(cdp, {
@@ -870,19 +1208,20 @@ async function inject(browser, known) {
             ok: true,
             fileName: path.basename(canonicalPinFilePath),
             openResult,
+            revisionDisabled,
           });
         } else if (change.type === "open") {
           let openResult;
           try {
             await stat(canonicalPinFilePath);
-            const target = await nativePinTarget(cdp, sessionId);
-            if (target.mirrored) {
-              await mkdir(path.dirname(target.filePath), { recursive: true });
+            const pinTarget = await nativePinTarget(cdp, sessionId);
+            if (pinTarget.mirrored) {
+              await mkdir(path.dirname(pinTarget.filePath), { recursive: true });
               try {
-                await stat(target.filePath);
+                await stat(pinTarget.filePath);
               } catch (error) {
                 if (error.code !== "ENOENT") throw error;
-                await copyFile(canonicalPinFilePath, target.filePath);
+                await copyFile(canonicalPinFilePath, pinTarget.filePath);
               }
             }
             const requestedPoint = change.fileMenuPoint;
@@ -890,12 +1229,12 @@ async function inject(browser, known) {
               ? { x: requestedPoint.x, y: requestedPoint.y }
               : null;
             openResult = await withPinVisibleToNativeIndexer(
-              target.filePath,
-              target.workspacePath,
-              () => openNativeFileTab(cdp, target.filePath, { fileMenuPoint }),
+              pinTarget.filePath,
+              pinTarget.workspacePath,
+              () => openNativeFileTab(cdp, pinTarget.filePath, { fileMenuPoint }),
             ).catch((error) => ({ ok: false, error: error.message }));
             if (openResult.ok !== true) {
-              openResult = await explainNativeOpenFailure(cdp, openResult, target.filePath);
+              openResult = await explainNativeOpenFailure(cdp, openResult, pinTarget.filePath);
             }
           } catch (error) {
             openResult = error.code === "ENOENT"
@@ -941,8 +1280,10 @@ async function inject(browser, known) {
       } catch (error) {
         console.error(`Chat Pin persistence failed: ${error.message}`);
         if (change?.requestId) {
+          const isRevision = typeof change.type === "string" && change.type.startsWith("revision-");
           await postHostMessage(cdp, {
-            type: change.type === "load" ? "load-result" : "save-result",
+            type: isRevision ? "revision-result" : change.type === "load" ? "load-result" : "save-result",
+            ...(isRevision ? { action: change.type.slice("revision-".length) } : {}),
             requestId: change.requestId,
             sessionId: safeSessionId(change.sessionId),
             ok: false,

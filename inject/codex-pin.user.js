@@ -1,12 +1,15 @@
 (() => {
   "use strict";
 
-  const VERSION = "0.6.6"; // Preserve Codex code blocks without copying their language-toolbar labels.
+  const VERSION = "0.7.1"; // Hidden-at-submit revision constraints with a visible mode indicator.
   const API_KEY = "__codexChatPinInjection__";
   const STYLE_ID = "codex-chat-pin-style";
   const BUTTON_ATTRIBUTE = "data-codex-chat-pin-button";
   const OPEN_ATTRIBUTE = "data-codex-chat-pin-open";
+  const REVISION_ATTRIBUTE = "data-codex-chat-pin-revision";
+  const REVISION_CARD_ATTRIBUTE = "data-codex-chat-pin-revision-card";
   const HIGHLIGHT_CLASS = "codex-chat-pin-source";
+  const REVISION_MARKER = "[Chat Pin 修订模式]";
   const PIN_ICON = `<svg viewBox="0 0 1024 1024" aria-hidden="true"><path d="M648.728381 130.779429a73.142857 73.142857 0 0 1 22.674286 15.433142l191.561143 191.756191a73.142857 73.142857 0 0 1-22.137905 118.564571l-67.876572 30.061715-127.341714 127.488-10.093714 140.239238a73.142857 73.142857 0 0 1-124.684191 46.445714l-123.66019-123.782095-210.724572 211.699809-51.833904-51.614476 210.846476-211.821714-127.926857-128.024381a73.142857 73.142857 0 0 1 46.299428-124.635429l144.237715-10.776381 125.074285-125.220571 29.379048-67.779048a73.142857 73.142857 0 0 1 96.207238-38.034285z m-29.086476 67.120761l-34.913524 80.530286-154.087619 154.331429-171.398095 12.751238 303.323428 303.542857 12.044191-167.399619 156.233143-156.428191 80.384-35.59619-191.585524-191.73181z"/></svg>`;
 
   try {
@@ -23,7 +26,13 @@
   let lastOpenResult = null;
   const pendingSaves = new Map();
   const pendingOpens = new Set();
+  const pendingRevisionRequests = new Map();
   const contentCache = new WeakMap();
+  let revisionState = { enabled: false };
+  let revisionTurn = null;
+  let bypassRevisionSubmit = false;
+  let revisionStatusSessionId = "";
+  let revisionCleanupPending = false;
 
   const visible = (node) => node?.isConnected && node.getClientRects().length > 0;
   const norm = (value) => String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
@@ -111,8 +120,14 @@
   }
 
   function updateIdentity() {
+    const previousId = identity.id;
     const next = currentSessionIdentity();
     if (next.reliable || !identity.reliable) identity = next;
+    if (identity.id !== previousId) {
+      revisionState = { enabled: false };
+      revisionTurn = null;
+      revisionStatusSessionId = "";
+    }
     return identity;
   }
 
@@ -120,6 +135,51 @@
     if (typeof window.__codexChatPinPersist !== "function") return false;
     window.__codexChatPinPersist(JSON.stringify(message));
     return true;
+  }
+
+  function requestRevision(action, payload = {}, timeoutMs = 8000) {
+    updateIdentity();
+    const requestId = `revision-${action}-${Date.now()}-${++requestSequence}`;
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        pendingRevisionRequests.delete(requestId);
+        reject(new Error("Pin 启动器没有响应修订请求"));
+      }, timeoutMs);
+      pendingRevisionRequests.set(requestId, { action, resolve, reject, timeout });
+      if (!hostRequest({
+        type: `revision-${action}`,
+        requestId,
+        sessionId: identity.id,
+        ...payload,
+      })) {
+        clearTimeout(timeout);
+        pendingRevisionRequests.delete(requestId);
+        reject(new Error("Pin 启动器未连接"));
+      }
+    });
+  }
+
+  function applyRevisionState(value) {
+    const next = value?.enabled === true && value.sessionId === identity.id
+      ? value
+      : { enabled: false };
+    revisionState = next;
+    if (!next.enabled) revisionTurn = null;
+    schedule();
+    return next;
+  }
+
+  async function syncRevisionStatus() {
+    updateIdentity();
+    if (revisionStatusSessionId === identity.id) return;
+    revisionStatusSessionId = identity.id;
+    try {
+      const message = await requestRevision("status");
+      applyRevisionState(message.state);
+    } catch (error) {
+      revisionStatusSessionId = "";
+      revisionState = { enabled: false };
+    }
   }
 
   function style() {
@@ -130,7 +190,17 @@
       [${BUTTON_ATTRIBUTE}="true"]{display:inline-flex!important;align-items:center;justify-content:center;min-width:32px!important;min-height:32px!important;padding:5px!important}
       [${BUTTON_ATTRIBUTE}="true"] svg{width:16px;height:16px;fill:currentColor}
       [${OPEN_ATTRIBUTE}="true"] svg{width:18px;height:18px;fill:currentColor}
+      [${REVISION_ATTRIBUTE}="true"][aria-pressed="true"]{color:#8fb3ff!important;background:#6798ff20!important}
+      [${REVISION_ATTRIBUTE}="true"]{white-space:nowrap}
       .${HIGHLIGHT_CLASS}{outline:1px solid #6798ff88;outline-offset:4px;border-radius:7px}
+      [${REVISION_CARD_ATTRIBUTE}="true"]{display:flex;align-items:center;gap:8px;margin:0 10px 8px;padding:7px 10px;border:1px solid #6798ff55;border-radius:8px;background:#6798ff14;color:inherit;font:12px/1.4 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+      [${REVISION_CARD_ATTRIBUTE}="true"] .codex-chat-pin-revision-label{font-weight:600;color:#9fbdff}
+      [${REVISION_CARD_ATTRIBUTE}="true"] .codex-chat-pin-revision-file{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      [${REVISION_CARD_ATTRIBUTE}="true"] button{margin-left:auto;border:0;background:transparent;color:inherit;cursor:pointer;padding:2px 5px;border-radius:4px}
+      [${REVISION_CARD_ATTRIBUTE}="true"] button:hover{background:#ffffff14}
+      [data-codex-chat-pin-submitting="true"] [data-codex-composer="true"][contenteditable="true"],
+      [data-codex-chat-pin-submitting="true"] [contenteditable="true"][role="textbox"],
+      [data-codex-chat-pin-submitting="true"] textarea{opacity:0!important;caret-color:transparent!important}
       .codex-chat-pin-toast{position:fixed;z-index:2147483647;right:18px;bottom:18px;max-width:380px;padding:10px 12px;border:1px solid #ffffff24;border-radius:8px;background:#262626;color:#f2f2f2;box-shadow:0 8px 30px #0008;font:13px/1.45 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
       .codex-chat-pin-toast[data-kind="error"]{border-color:#d96b6255;background:#402726;color:#ffd7d3}
     `;
@@ -364,8 +434,19 @@
     return value;
   }
 
-  function pin(pair, button) {
+  async function pin(pair, button) {
     updateIdentity();
+    if (revisionState.enabled && revisionState.sessionId === identity.id) {
+      const confirmed = window.confirm("当前 Pin 正在修订。继续会用这条回复替换 Pin 文件并退出修订模式，是否继续？");
+      if (!confirmed) return;
+      try {
+        const message = await requestRevision("disable");
+        applyRevisionState(message.state);
+      } catch (error) {
+        toast(`无法安全退出修订模式：${error.message}`, "error");
+        return;
+      }
+    }
     const value = content(pair.message);
     if (!value) {
       toast("没有识别到可保存的助手回复。", "error");
@@ -470,6 +551,244 @@
     }
   }
 
+  function activeNativePinTab() {
+    const wanted = norm(fileName());
+    return [...document.querySelectorAll('[role="tab"]')].find((tab) => {
+      if (!visible(tab)) return false;
+      const selected = tab.getAttribute("aria-selected") === "true"
+        || tab.getAttribute("data-state") === "active"
+        || tab.matches("[data-selected='true']");
+      const label = norm(`${tab.textContent} ${tab.getAttribute("aria-label")} ${tab.title}`);
+      return selected && label.includes(wanted);
+    }) || null;
+  }
+
+  function sourceCodeButtons() {
+    if (!activeNativePinTab()) return [];
+    return [...document.querySelectorAll("button,a")].filter((node) => {
+      if (!visible(node) || node.hasAttribute(REVISION_ATTRIBUTE)) return false;
+      const labels = [node.textContent, node.getAttribute("aria-label"), node.title].map(norm).filter(Boolean);
+      return labels.some((label) => /^(查看源代码|view source(?: code)?)$/.test(label));
+    });
+  }
+
+  async function toggleRevision(button) {
+    button.disabled = true;
+    try {
+      const action = revisionState.enabled ? "disable" : "enable";
+      const message = await requestRevision(action);
+      applyRevisionState(message.state);
+      revisionStatusSessionId = identity.id;
+      toast(message.state?.enabled
+        ? `已启用修订：${message.state.relativePath}`
+        : "已关闭修订模式");
+    } catch (error) {
+      toast(`修订模式切换失败：${error.message}`, "error");
+    } finally {
+      if (button.isConnected) button.disabled = false;
+    }
+  }
+
+  function addRevisionButtons() {
+    const sources = sourceCodeButtons();
+    const valid = new Set();
+    for (const source of sources) {
+      const container = source.parentElement;
+      if (!container) continue;
+      let button = container.querySelector(`:scope > [${REVISION_ATTRIBUTE}="true"]`);
+      if (!button) {
+        button = source.cloneNode(true);
+        button.removeAttribute("id");
+        button.querySelectorAll("[id]").forEach((node) => node.removeAttribute("id"));
+        button.setAttribute(REVISION_ATTRIBUTE, "true");
+        button.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          void toggleRevision(button);
+        });
+        source.insertAdjacentElement("beforebegin", button);
+      }
+      const enabled = revisionState.enabled && revisionState.sessionId === identity.id;
+      button.textContent = enabled ? "修订中" : "修订";
+      button.setAttribute("aria-label", enabled ? "关闭 Pin 文件修订模式" : "启用 Pin 文件修订模式");
+      button.setAttribute("aria-pressed", String(enabled));
+      button.title = enabled ? "关闭修订模式" : "后续消息将直接修改当前 Pin 文件";
+      valid.add(button);
+    }
+    document.querySelectorAll(`[${REVISION_ATTRIBUTE}="true"]`).forEach((button) => {
+      if (!valid.has(button)) button.remove();
+    });
+  }
+
+  function threadComposerRoot() {
+    return [...document.querySelectorAll('[data-codex-composer-root][data-composer-placement="thread"]')]
+      .find(visible) || null;
+  }
+
+  function composerEditor(rootNode = threadComposerRoot()) {
+    return [...(rootNode?.querySelectorAll(
+      '[data-codex-composer="true"][contenteditable="true"],[contenteditable="true"][role="textbox"],textarea',
+    ) || [])].find(visible) || null;
+  }
+
+  function addRevisionCard() {
+    const enabled = revisionState.enabled && revisionState.sessionId === identity.id;
+    const rootNode = enabled ? threadComposerRoot() : null;
+    const existingCards = [...document.querySelectorAll(`[${REVISION_CARD_ATTRIBUTE}="true"]`)];
+    if (!rootNode) {
+      existingCards.forEach((node) => node.remove());
+      return;
+    }
+    let card = existingCards.find((node) => rootNode.contains(node));
+    existingCards.filter((node) => node !== card).forEach((node) => node.remove());
+    if (!card) {
+      card = document.createElement("div");
+      card.setAttribute(REVISION_CARD_ATTRIBUTE, "true");
+      card.innerHTML = '<span class="codex-chat-pin-revision-label">修订中</span><span class="codex-chat-pin-revision-file"></span><button type="button" aria-label="退出修订模式">退出</button>';
+      card.querySelector("button").addEventListener("click", async () => {
+        try {
+          const message = await requestRevision("disable");
+          applyRevisionState(message.state);
+          toast("已关闭修订模式");
+        } catch (error) {
+          toast(`关闭修订模式失败：${error.message}`, "error");
+        }
+      });
+      const editor = composerEditor(rootNode);
+      let anchor = editor;
+      while (anchor?.parentElement && anchor.parentElement !== rootNode) anchor = anchor.parentElement;
+      if (anchor?.parentElement === rootNode) rootNode.insertBefore(card, anchor);
+      else rootNode.prepend(card);
+    }
+    card.querySelector(".codex-chat-pin-revision-file").textContent = revisionState.relativePath;
+    card.title = `下一条消息将直接修改 ${revisionState.relativePath}`;
+  }
+
+  function sendButton(rootNode) {
+    const candidates = [...(rootNode?.querySelectorAll("button") || [])].filter((button) => {
+      if (!visible(button) || button.disabled) return false;
+      const label = norm(`${button.textContent} ${button.getAttribute("aria-label")} ${button.title}`);
+      return !/(停止|stop|取消|cancel)/.test(label);
+    });
+    const labelled = candidates.find((button) => {
+      const labels = [button.textContent, button.getAttribute("aria-label"), button.title].map(norm).filter(Boolean);
+      return labels.some((label) => /发送|send|submit/.test(label));
+    });
+    return labelled || candidates.findLast((button) => button.getAttribute("type") === "submit") || null;
+  }
+
+  function cleanupLegacyRevisionComposer() {
+    const editor = composerEditor();
+    if (!editor || revisionCleanupPending) return;
+    const text = editor instanceof HTMLTextAreaElement ? editor.value : editor.innerText || "";
+    if (text.includes(REVISION_MARKER)) {
+      revisionCleanupPending = true;
+      void requestRevision("cleanup")
+        .catch((error) => toast(`残留修订指令清理失败：${error.message}`, "error"))
+        .finally(() => { revisionCleanupPending = false; });
+    }
+  }
+
+  async function finishActiveRevisionTurn(reason = "reply") {
+    const turn = revisionTurn;
+    if (!turn || turn.finishing) return;
+    turn.finishing = true;
+    clearTimeout(turn.timeout);
+    try {
+      const message = await requestRevision("turn-finish", { turnId: turn.turnId }, 12_000);
+      applyRevisionState(message.state);
+      if (message.state?.changed) {
+        toast(`已修订 ${message.state.relativePath}`);
+      } else {
+        toast(reason === "timeout"
+          ? "修订等待超时，目标文件没有发生变化"
+          : "回答已完成，但目标 Pin 文件没有发生变化", "error");
+      }
+    } catch (error) {
+      toast(`修订结果核验失败：${error.message}`, "error");
+    } finally {
+      if (revisionTurn === turn) revisionTurn = null;
+    }
+  }
+
+  function maybeFinishRevisionTurn(activePairs) {
+    if (!revisionTurn || revisionTurn.finishing) return;
+    const fingerprints = activePairs.map((pair) => content(pair.message)?.fingerprint).filter(Boolean);
+    const hasNewReply = activePairs.length > revisionTurn.replyCount
+      || fingerprints.some((fingerprint) => !revisionTurn.replyFingerprints.has(fingerprint));
+    if (hasNewReply && Date.now() - revisionTurn.startedAt > 400) {
+      void finishActiveRevisionTurn();
+    }
+  }
+
+  async function prepareRevisionSubmit(event, rootNode) {
+    if (!revisionState.enabled || revisionState.sessionId !== identity.id) return;
+    if (bypassRevisionSubmit) {
+      bypassRevisionSubmit = false;
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    if (revisionTurn) {
+      toast("上一轮修订仍在处理中，请等待完成后再发送", "error");
+      return;
+    }
+    const editor = composerEditor(rootNode);
+    const input = (editor instanceof HTMLTextAreaElement ? editor.value : editor?.innerText || "").trim();
+    if (!editor || !input) {
+      toast("请输入本次文档修改要求", "error");
+      return;
+    }
+    const button = sendButton(rootNode);
+    if (!button) {
+      toast("无法开始修订：未找到可用的 Codex 发送按钮", "error");
+      return;
+    }
+    const activePairs = pairs();
+    const turnId = `turn-${Date.now()}-${++requestSequence}`;
+    let turnStarted = false;
+    try {
+      await requestRevision("turn-start", { turnId, input }, 12_000);
+      turnStarted = true;
+      revisionTurn = {
+        turnId,
+        sessionId: identity.id,
+        startedAt: Date.now(),
+        replyCount: activePairs.length,
+        replyFingerprints: new Set(activePairs.map((pair) => content(pair.message)?.fingerprint).filter(Boolean)),
+        finishing: false,
+        timeout: setTimeout(() => void finishActiveRevisionTurn("timeout"), 10 * 60 * 1000),
+      };
+      bypassRevisionSubmit = true;
+      button.click();
+      setTimeout(() => {
+        rootNode.removeAttribute("data-codex-chat-pin-submitting");
+      }, 250);
+      queueMicrotask(() => { bypassRevisionSubmit = false; });
+    } catch (error) {
+      if (turnStarted) {
+        void requestRevision("turn-finish", { turnId }, 12_000).catch(() => {});
+      }
+      toast(`无法开始修订：${error.message}`, "error");
+    }
+  }
+
+  function handleSubmitClick(event) {
+    const rootNode = event.target?.closest?.('[data-codex-composer-root][data-composer-placement="thread"]');
+    if (!rootNode || !revisionState.enabled) return;
+    const button = event.target.closest("button");
+    if (!button || button !== sendButton(rootNode)) return;
+    void prepareRevisionSubmit(event, rootNode);
+  }
+
+  function handleSubmitKeydown(event) {
+    if (event.key !== "Enter" || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey || event.isComposing) return;
+    const rootNode = event.target?.closest?.('[data-codex-composer-root][data-composer-placement="thread"]');
+    if (!rootNode || !revisionState.enabled || !composerEditor(rootNode)?.contains(event.target)) return;
+    void prepareRevisionSubmit(event, rootNode);
+  }
+
   function refresh() {
     const activePairs = pairs();
     const activeFooters = new Set(activePairs.map((pair) => pair.footer));
@@ -482,6 +801,10 @@
       pair.message.classList.toggle(HIGHLIGHT_CLASS, Boolean(lastPinnedFingerprint && value?.fingerprint === lastPinnedFingerprint));
     }
     addOpenPinEntries();
+    addRevisionButtons();
+    addRevisionCard();
+    cleanupLegacyRevisionComposer();
+    maybeFinishRevisionTurn(activePairs);
   }
 
   function receiveHostMessage(payload) {
@@ -489,6 +812,15 @@
     try {
       message = typeof payload === "string" ? JSON.parse(payload) : payload;
     } catch {
+      return;
+    }
+    if (message?.type === "revision-result") {
+      const pending = pendingRevisionRequests.get(message.requestId);
+      if (!pending) return;
+      clearTimeout(pending.timeout);
+      pendingRevisionRequests.delete(message.requestId);
+      if (!message.ok) pending.reject(new Error(message.error || "修订请求失败"));
+      else pending.resolve(message);
       return;
     }
     if (message?.type === "open-result") {
@@ -515,6 +847,10 @@
       toast(`Markdown 保存失败：${message.error || "未知错误"}`, "error");
       return;
     }
+    if (message.revisionDisabled) {
+      revisionState = { enabled: false };
+      revisionTurn = null;
+    }
     if (!message.openResult?.ok) {
       toast(`已保存 ${message.fileName}，但原生文件页打开失败：${message.openResult?.error || "未找到文件入口"}`, "error");
       return;
@@ -531,26 +867,39 @@
       timer = null;
       updateIdentity();
       refresh();
+      void syncRevisionStatus();
     }, 180);
   }
 
   function mount() {
     style();
     refresh();
+    document.addEventListener("click", handleSubmitClick, true);
+    document.addEventListener("keydown", handleSubmitKeydown, true);
     observer = new MutationObserver(schedule);
     observer.observe(document.documentElement, { childList: true, subtree: true });
+    void syncRevisionStatus();
   }
 
   function destroy() {
     observer?.disconnect();
     clearTimeout(timer);
+    clearTimeout(revisionTurn?.timeout);
+    document.removeEventListener("click", handleSubmitClick, true);
+    document.removeEventListener("keydown", handleSubmitKeydown, true);
     document.getElementById(STYLE_ID)?.remove();
     document.querySelectorAll(`[${BUTTON_ATTRIBUTE}="true"]`).forEach((node) => node.remove());
     document.querySelectorAll(`[${OPEN_ATTRIBUTE}="true"]`).forEach((node) => node.remove());
+    document.querySelectorAll(`[${REVISION_ATTRIBUTE}="true"],[${REVISION_CARD_ATTRIBUTE}="true"]`).forEach((node) => node.remove());
     document.querySelectorAll(`.${HIGHLIGHT_CLASS}`).forEach((node) => node.classList.remove(HIGHLIGHT_CLASS));
     document.querySelector(".codex-chat-pin-toast")?.remove();
     pendingSaves.clear();
     pendingOpens.clear();
+    for (const pending of pendingRevisionRequests.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error("Chat Pin 注入已重新加载"));
+    }
+    pendingRevisionRequests.clear();
   }
 
   window[API_KEY] = {
@@ -568,6 +917,9 @@
       assistantReplies: pairs().length,
       pinButtons: document.querySelectorAll(`[${BUTTON_ATTRIBUTE}="true"]`).length,
       openPinEntries: document.querySelectorAll(`[${OPEN_ATTRIBUTE}="true"]`).length,
+      revisionButtons: document.querySelectorAll(`[${REVISION_ATTRIBUTE}="true"]`).length,
+      revisionState,
+      revisionTurn: revisionTurn ? { turnId: revisionTurn.turnId, startedAt: revisionTurn.startedAt } : null,
       customPanel: false,
       pendingSaves: pendingSaves.size,
       lastOpenResult,
