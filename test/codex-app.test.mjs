@@ -15,10 +15,17 @@ test("Windows resolves the Microsoft Store desktop executable, not the bundled C
     platform: "win32",
     explicitPath: "",
     pathExists: (candidate) => candidate === expected,
-    runSync: () => ({ status: 0, stdout: `${installLocation}\r\n` }),
+    runSync: () => ({
+      status: 0,
+      stdout: JSON.stringify({
+        InstallLocation: installLocation,
+        PackageFamilyName: "OpenAI.Codex_example",
+      }),
+    }),
   });
 
   assert.equal(resolved.executablePath, expected);
+  assert.equal(resolved.appUserModelId, "OpenAI.Codex_example!App");
   assert.doesNotMatch(resolved.executablePath, /resources[\\/]codex\.exe$/i);
 });
 

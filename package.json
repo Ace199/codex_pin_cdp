@@ -1,6 +1,6 @@
 {
   "name": "codex-chat-pin",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "private": true,
   "type": "module",
   "engines": { "node": ">=22.5" },
@@ -9,6 +9,6 @@
     "launch": "node scripts/pin-launcher.mjs --launch --watch",
     "inject": "node scripts/pin-launcher.mjs --watch",
     "test": "node --test test/*.test.mjs",
-    "check": "node --check scripts/pin-launcher.mjs && node --check scripts/codex-app.mjs && node --check scripts/cdp-pipe.mjs && node --check inject/codex-pin.user.js && npm test"
+    "check": "node --check scripts/pin-launcher.mjs && node --check scripts/codex-app.mjs && node --check scripts/cdp-pipe.mjs && node --check scripts/cdp-websocket.mjs && node --check scripts/windows-app-activation.mjs && node --check inject/codex-pin.user.js && npm test"
   }
 }

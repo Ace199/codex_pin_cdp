@@ -62,12 +62,22 @@ export function resolveCodexDesktop({
     "-NoProfile",
     "-NonInteractive",
     "-Command",
-    "(Get-AppxPackage -Name OpenAI.Codex | Select-Object -First 1 -ExpandProperty InstallLocation).Trim()",
+    "$package = Get-AppxPackage -Name OpenAI.Codex | Select-Object -First 1; if ($package) { [pscustomobject]@{ InstallLocation = $package.InstallLocation; PackageFamilyName = $package.PackageFamilyName } | ConvertTo-Json -Compress }",
   ], { encoding: "utf8", windowsHide: true });
-  const installLocation = result.status === 0 ? result.stdout.trim() : "";
+  let packageInfo = null;
+  try {
+    packageInfo = result.status === 0 ? JSON.parse(result.stdout.trim()) : null;
+  } catch {}
+  const installLocation = packageInfo?.InstallLocation?.trim() || "";
   const appPath = installLocation && path.win32.join(installLocation, "app", "ChatGPT.exe");
   if (!appPath || !pathExists(appPath)) {
     throw new Error("未找到 Microsoft Store 版 Codex。请先安装或更新 OpenAI.Codex，或使用 --app-path 指定 ChatGPT.exe。");
   }
-  return { appPath, executablePath: appPath, source: "appx" };
+  const packageFamilyName = packageInfo?.PackageFamilyName?.trim() || "";
+  return {
+    appPath,
+    executablePath: appPath,
+    appUserModelId: packageFamilyName ? `${packageFamilyName}!App` : "",
+    source: "appx",
+  };
 }

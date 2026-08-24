@@ -14,6 +14,10 @@ Windows 也可以直接双击项目根目录的 `ChatGPT_Pin.cmd`，或使用安
 
 启动器参照 Codex Taskboard 的桌面端启动方式定位官方应用：Windows 查找 Microsoft Store 包内的 `app\\ChatGPT.exe`，macOS 依次查找 `/Applications` 和 `~/Applications` 下的 `ChatGPT.app`、`Codex.app`，然后直接向桌面端传递独立 profile 与私有 CDP pipe 参数。`resources\\codex.exe`（macOS 中为 `Contents/Resources/codex`）是 CLI，不用于启动桌面界面。
 
+部分 Windows 安装会拒绝 Node 直接创建 WindowsApps 内的桌面进程并返回 `spawn EPERM`。遇到该错误时，启动器会自动通过注册的 Codex AUMID 激活应用，传入相同的独立 profile，并使用随机的 `127.0.0.1` CDP WebSocket 端口继续注入。可用 `--windows-activation` 主动测试该路径。此端口没有额外身份验证，因此启动器运行期间只能运行受信任的本机程序。
+
+默认独立 profile 位于项目的 `.codex-pin-profile`；测试或多实例场景可通过 `CODEX_PIN_PROFILE` 指定其他目录。
+
 应用安装在非默认位置时可显式指定。macOS 可传 `.app` 路径或内部可执行文件；Windows 传桌面端 `ChatGPT.exe`：
 
 ```powershell

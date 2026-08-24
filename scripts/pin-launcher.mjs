@@ -3,13 +3,18 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { copyFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveCodexDesktop } from "./codex-app.mjs";
 import { CdpPipeBrowser } from "./cdp-pipe.mjs";
+import { CdpWebSocketBrowser } from "./cdp-websocket.mjs";
+import { activateWindowsApp } from "./windows-app-activation.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const profilePath = path.join(root, ".codex-pin-profile");
+const profilePath = process.env.CODEX_PIN_PROFILE
+  ? path.resolve(process.env.CODEX_PIN_PROFILE)
+  : path.join(root, ".codex-pin-profile");
 const userScriptPath = path.join(root, "inject", "codex-pin.user.js");
 const pinDirectory = path.join(root, "pins");
 const legacyPinDirectory = path.join(root, "temp");
@@ -19,6 +24,7 @@ const argv = process.argv.slice(2);
 const args = new Set(argv);
 const shouldLaunch = args.has("--launch");
 const shouldWatch = args.has("--watch");
+const forceWindowsActivation = args.has("--windows-activation");
 const writeQueues = new Map();
 let pinVisibilityQueue = Promise.resolve();
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -574,6 +580,76 @@ async function loadSource() {
   return `window.__CODEX_PIN_SOURCE_HASH__=${JSON.stringify(hash)};\n${script}\n//# sourceURL=codex-pin.user.js`;
 }
 
+async function reserveLoopbackPort() {
+  const server = createServer();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen({ host: "127.0.0.1", port: 0, exclusive: true }, resolve);
+  });
+  const address = server.address();
+  const port = typeof address === "object" && address ? address.port : 0;
+  await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  if (!Number.isInteger(port) || port <= 0) throw new Error("无法为 Codex CDP 分配本机端口");
+  return port;
+}
+
+async function waitForLoopbackCdp(port, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  const endpoint = `http://127.0.0.1:${port}/json/version`;
+  do {
+    try {
+      const response = await fetch(endpoint, { signal: AbortSignal.timeout(1_000) });
+      if (response.ok) {
+        const version = await response.json();
+        const webSocketUrl = new URL(version.webSocketDebuggerUrl);
+        if (webSocketUrl.protocol !== "ws:" || webSocketUrl.hostname !== "127.0.0.1" || Number(webSocketUrl.port) !== port) {
+          throw new Error("Codex 返回了非本机 CDP WebSocket 地址");
+        }
+        return webSocketUrl.toString();
+      }
+    } catch (error) {
+      if (error.message.includes("非本机 CDP")) throw error;
+    }
+    await delay(150);
+  } while (Date.now() < deadline);
+  throw new Error(`Windows 已激活 Codex，但 CDP 端口 ${port} 未在 30 秒内就绪`);
+}
+
+async function launchCodexWithWindowsActivation() {
+  if (process.platform !== "win32") throw new Error("AUMID activation is available only on Windows");
+  if (!codexDesktop.appUserModelId) {
+    throw new Error("当前 --app-path 没有对应的 Codex AUMID，无法使用 Windows 激活备用路径");
+  }
+  const port = await reserveLoopbackPort();
+  const launchArguments = [
+    `--user-data-dir="${profilePath.replaceAll('"', '\\"')}"`,
+    "--remote-debugging-address=127.0.0.1",
+    `--remote-debugging-port=${port}`,
+    `--remote-allow-origins=http://127.0.0.1:${port}`,
+  ].join(" ");
+  const processId = activateWindowsApp({
+    appUserModelId: codexDesktop.appUserModelId,
+    launchArguments,
+  });
+  try {
+    const webSocketUrl = await waitForLoopbackCdp(port);
+    const activatedBrowser = new CdpWebSocketBrowser(webSocketUrl);
+    await activatedBrowser.open();
+    return { browser: activatedBrowser, processId, port };
+  } catch (error) {
+    spawnSync("taskkill.exe", ["/PID", String(processId), "/T", "/F"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    throw error;
+  }
+}
+
+function windowsSpawnWasDenied(error) {
+  return process.platform === "win32"
+    && (error?.code === "EPERM" || /(?:spawn\s+)?EPERM/i.test(error?.message || ""));
+}
+
 async function inject(browser, known) {
   const source = await loadSource();
   for (const target of (await browser.targets()).filter(isCodexRenderer)) {
@@ -714,13 +790,15 @@ async function inject(browser, known) {
 
 let child = null;
 let browser = null;
+let managedProcessId = null;
 let rendererWasInjected = false;
 const known = new Map();
 
 function stopManagedCodex() {
-  if (!child?.pid || child.exitCode !== null) return;
+  const processId = managedProcessId || child?.pid;
+  if (!processId || (child && child.exitCode !== null)) return;
   if (process.platform === "win32") {
-    spawnSync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
+    spawnSync("taskkill.exe", ["/PID", String(processId), "/T", "/F"], {
       stdio: "ignore",
       windowsHide: true,
     });
@@ -733,23 +811,37 @@ process.once("exit", stopManagedCodex);
 
 try {
   if (!shouldLaunch) throw new Error("Existing Codex windows cannot be injected without CDP. Use: npm start");
-  child = spawn(appPath, [
-    `--user-data-dir=${profilePath}`,
-    "--remote-debugging-pipe",
-  ], {
-    stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"],
-    windowsHide: false,
-  });
-  browser = new CdpPipeBrowser(child);
-  const launchFailure = new Promise((_, reject) => {
-    child.once("error", (error) => {
-      const hint = error.code === "EPERM" && process.platform === "win32"
-        ? "；当前启动的是 app\\ChatGPT.exe，而不是 resources\\codex.exe。请确认当前账户可启动 Microsoft Store Codex，或用 --app-path 指定可执行文件"
-        : "";
-      reject(new Error(`无法启动 Codex Desktop (${error.code || error.message})${hint}`));
-    });
-  });
-  await Promise.race([browser.open(), launchFailure]);
+  if (forceWindowsActivation) {
+    const activated = await launchCodexWithWindowsActivation();
+    browser = activated.browser;
+    managedProcessId = activated.processId;
+    console.log(`Chat Pin launched Codex through Windows app activation on loopback CDP port ${activated.port}.`);
+  } else {
+    try {
+      child = spawn(appPath, [
+        `--user-data-dir=${profilePath}`,
+        "--remote-debugging-pipe",
+      ], {
+        stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"],
+        windowsHide: false,
+      });
+      managedProcessId = child.pid || null;
+      browser = new CdpPipeBrowser(child);
+      const launchFailure = new Promise((_, reject) => child.once("error", reject));
+      await Promise.race([browser.open(), launchFailure]);
+    } catch (error) {
+      browser?.close();
+      browser = null;
+      child = null;
+      managedProcessId = null;
+      if (!windowsSpawnWasDenied(error)) throw error;
+      console.warn("Direct Codex launch was denied by Windows (EPERM); retrying through the registered app AUMID.");
+      const activated = await launchCodexWithWindowsActivation();
+      browser = activated.browser;
+      managedProcessId = activated.processId;
+      console.log(`Chat Pin launched Codex through Windows app activation on loopback CDP port ${activated.port}.`);
+    }
+  }
   const deadline = Date.now() + 45_000;
   while (Date.now() < deadline && known.size === 0) {
     await inject(browser, known);
