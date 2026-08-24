@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const VERSION = "0.5.6"; // Wait for the expanding side panel's File button position to settle.
+  const VERSION = "0.5.7"; // Store Pin files in a workspace-visible directory outside .gitignore.
   const API_KEY = "__codexChatPinInjection__";
   const STYLE_ID = "codex-chat-pin-style";
   const BUTTON_ATTRIBUTE = "data-codex-chat-pin-button";

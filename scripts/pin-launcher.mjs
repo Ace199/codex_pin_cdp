@@ -2,7 +2,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CdpPipeBrowser } from "./cdp-pipe.mjs";
@@ -10,7 +10,9 @@ import { CdpPipeBrowser } from "./cdp-pipe.mjs";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const profilePath = path.join(root, ".codex-pin-profile");
 const userScriptPath = path.join(root, "inject", "codex-pin.user.js");
-const pinDirectory = path.join(root, "temp");
+const pinDirectory = path.join(root, "pins");
+const legacyPinDirectory = path.join(root, "temp");
+const localGitExcludePath = path.join(root, ".git", "info", "exclude");
 const args = new Set(process.argv.slice(2));
 const shouldLaunch = args.has("--launch");
 const shouldWatch = args.has("--watch");
@@ -52,6 +54,39 @@ function safeSessionId(value) {
 function pinFileFor(sessionId) {
   return path.join(pinDirectory, `pin_${safeSessionId(sessionId)}.md`);
 }
+
+async function preparePinStorage() {
+  await mkdir(pinDirectory, { recursive: true });
+
+  if (existsSync(localGitExcludePath)) {
+    try {
+      const rule = "/pins/pin_*.md";
+      const current = await readFile(localGitExcludePath, "utf8");
+      const rules = current.split(/\r?\n/).map((line) => line.trim());
+      if (!rules.includes(rule)) {
+        const separator = current && !current.endsWith("\n") ? "\n" : "";
+        await writeFile(localGitExcludePath, `${current}${separator}${rule}\n`, "utf8");
+      }
+    } catch (error) {
+      console.warn(`Chat Pin could not update .git/info/exclude: ${error.message}`);
+    }
+  }
+
+  if (!existsSync(legacyPinDirectory)) return;
+  for (const entry of await readdir(legacyPinDirectory, { withFileTypes: true })) {
+    if (!entry.isFile() || !/^pin_.+\.md$/i.test(entry.name) || /_probe\.md$/i.test(entry.name)) continue;
+    const source = path.join(legacyPinDirectory, entry.name);
+    const destination = path.join(pinDirectory, entry.name);
+    try {
+      await stat(destination);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      await copyFile(source, destination);
+    }
+  }
+}
+
+await preparePinStorage();
 
 async function postHostMessage(cdp, message) {
   const payload = JSON.stringify(message);

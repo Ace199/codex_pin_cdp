@@ -1,0 +1,3 @@
+# Keep generated Pin Markdown visible to ripgrep-based workspace file pickers.
+!pins/
+!pins/pin_*.md
