@@ -1,5 +1,6 @@
 @echo off
 setlocal
+chcp 65001 >nul
 cd /d "%~dp0"
 title ChatGPT Pin
 
@@ -8,6 +9,7 @@ if errorlevel 1 goto npm_missing
 
 echo [ChatGPT Pin] Starting a dedicated Codex window...
 echo Keep this window open. Closing it stops the dedicated Pin instance.
+echo Collection CLI progress and heartbeat messages will appear here.
 echo.
 call npm.cmd start
 if errorlevel 1 goto launch_failed
@@ -24,4 +26,3 @@ echo.
 echo [ChatGPT Pin] Launch failed. Keep the error message above for diagnosis.
 pause
 exit /b 1
-

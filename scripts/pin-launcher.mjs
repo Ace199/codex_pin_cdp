@@ -1,12 +1,28 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { copyFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveCodexDesktop } from "./codex-app.mjs";
+import {
+  CodexAppServerClient,
+  clearCompletedCollectionItems,
+  clearCollectionItems,
+  collectionItemIsCurrent,
+  collectionPrompt,
+  collectionRuntimeOptions,
+  parseDesktopExecutionPreference,
+  prepareCollectionPreflight,
+  probeCodexCli,
+  recoverCollectionItems,
+  resolveCollectionSourceInWorkspace,
+  resolveCodexCli,
+  retryFailedCollectionItems,
+  selectCollectionExecutionProfile,
+} from "./collection-mode.mjs";
 import { CdpPipeBrowser } from "./cdp-pipe.mjs";
 import { CdpWebSocketBrowser } from "./cdp-websocket.mjs";
 import {
@@ -28,8 +44,14 @@ const userScriptPath = path.join(root, "inject", "codex-pin.user.js");
 const pinDirectory = path.join(root, "pins");
 const legacyPinDirectory = path.join(root, "temp");
 const revisionHistoryDirectory = path.join(profilePath, "revision-history");
+const collectionQueueDirectory = path.join(profilePath, "collection-queue");
+const collectionWorkspaceDirectory = path.join(profilePath, "collection-workspace");
+const collectionDirectory = path.join(root, "collections"); // Legacy result location; no new files are written here.
 const localGitExcludePath = path.join(root, ".git", "info", "exclude");
 const pinGitExcludeRule = "/pins/pin_*.md";
+const collectionGitExcludeRule = "/collections/collection_*.md";
+const collectionProtocolVersion = 7;
+const collectionCapabilities = Object.freeze(["retry", "clear", "clear-reports", "persistent-mode", "workspace-write", "execution-reports", "collection-performance", "desktop-execution-selection"]);
 const argv = process.argv.slice(2);
 const args = new Set(argv);
 const shouldLaunch = args.has("--launch");
@@ -37,8 +59,32 @@ const shouldWatch = args.has("--watch");
 const forceWindowsActivation = args.has("--windows-activation");
 const writeQueues = new Map();
 const revisionStates = new Map();
+const collectionModes = new Map();
+const collectionQueues = new Map();
+const collectionQueueLoads = new Map();
+const collectionItemControllers = new Map();
 let pinVisibilityQueue = Promise.resolve();
+let collectionPump = null;
+let collectionBackend = null;
+let collectionBackendPromise = null;
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+function collectionDuration(milliseconds) {
+  const numeric = Math.max(0, Number(milliseconds || 0));
+  if (numeric < 1000) return `${Math.round(numeric)}ms`;
+  const totalSeconds = Math.floor(numeric / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes ? `${minutes}m ${String(seconds).padStart(2, "0")}s` : `${seconds}s`;
+}
+
+function collectionTerminalLog(item, message, level = "log") {
+  const timestamp = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  const itemId = String(item?.id || "unknown").replace(/^collect_/, "").slice(-8);
+  const line = `[Chat Pin][Collection ${itemId}][${timestamp}] ${message}`;
+  const writer = level === "error" ? console.error : level === "warn" ? console.warn : console.log;
+  writer(line);
+}
 
 function optionValue(name) {
   const index = argv.indexOf(name);
@@ -69,15 +115,20 @@ function pinFileFor(sessionId) {
 }
 
 async function preparePinStorage() {
-  await mkdir(pinDirectory, { recursive: true });
+  await Promise.all([
+    mkdir(pinDirectory, { recursive: true }),
+    mkdir(collectionQueueDirectory, { recursive: true }),
+    mkdir(collectionWorkspaceDirectory, { recursive: true }),
+  ]);
 
   if (existsSync(localGitExcludePath)) {
     try {
       const current = await readFile(localGitExcludePath, "utf8");
       const rules = current.split(/\r?\n/).map((line) => line.trim());
-      if (!rules.includes(pinGitExcludeRule)) {
+      const missingRules = [pinGitExcludeRule, collectionGitExcludeRule].filter((rule) => !rules.includes(rule));
+      if (missingRules.length) {
         const separator = current && !current.endsWith("\n") ? "\n" : "";
-        await writeFile(localGitExcludePath, `${current}${separator}${pinGitExcludeRule}\n`, "utf8");
+        await writeFile(localGitExcludePath, `${current}${separator}${missingRules.join("\n")}\n`, "utf8");
       }
     } catch (error) {
       console.warn(`Chat Pin could not update .git/info/exclude: ${error.message}`);
@@ -139,10 +190,14 @@ function indexVisibilityRules(filePath, workspacePath) {
   const relative = path.relative(gitContext.topLevel, filePath);
   if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return null;
   const exactRule = `/${relative.replaceAll("\\", "/")}`;
+  const rootProtectRule = samePath(workspacePath, root)
+    && samePath(path.dirname(filePath), collectionDirectory)
+    ? collectionGitExcludeRule
+    : pinGitExcludeRule;
   return {
     excludePath: gitContext.excludePath,
     exactRule,
-    protectRule: samePath(workspacePath, root) ? pinGitExcludeRule : exactRule,
+    protectRule: samePath(workspacePath, root) ? rootProtectRule : exactRule,
   };
 }
 
@@ -160,6 +215,24 @@ function gitIgnoreReason(filePath, workspacePath) {
   return result.stdout.trim().split(/\r?\n/).at(-1) || "";
 }
 
+async function protectWorkspaceFileInGit(filePath, workspacePath) {
+  const visibility = indexVisibilityRules(filePath, workspacePath);
+  if (!visibility?.excludePath || !visibility.protectRule) return;
+  try {
+    const current = await readFile(visibility.excludePath, "utf8").catch((error) => {
+      if (error.code === "ENOENT") return "";
+      throw error;
+    });
+    const rules = current.split(/\r?\n/).map((line) => line.trim());
+    if (rules.includes(visibility.protectRule)) return;
+    const separator = current && !current.endsWith("\n") ? "\n" : "";
+    await mkdir(path.dirname(visibility.excludePath), { recursive: true });
+    await writeFile(visibility.excludePath, `${current}${separator}${visibility.protectRule}\n`, "utf8");
+  } catch (error) {
+    console.warn(`Chat Pin could not protect a collection result in Git: ${error.message}`);
+  }
+}
+
 async function withPinVisibleToNativeIndexer(filePath, workspacePath, action) {
   const run = async () => {
     const visibility = indexVisibilityRules(filePath, workspacePath);
@@ -172,7 +245,7 @@ async function withPinVisibleToNativeIndexer(filePath, workspacePath, action) {
         const filtered = lines.filter((line) => {
           const rule = line.trim();
           const shouldRemove = rule === visibility.exactRule
-            || (samePath(workspacePath, root) && rule === pinGitExcludeRule);
+            || (samePath(workspacePath, root) && rule === visibility.protectRule);
           if (shouldRemove) removedRules.push(line);
           return !shouldRemove;
         });
@@ -405,6 +478,25 @@ async function cleanRevisionComposer(cdp) {
   return { cleaned: false, error: "无法从 Codex 输入框移除修订指令" };
 }
 
+async function clearCollectionComposer(cdp, userInput) {
+  const expected = String(userInput || "").trim();
+  const before = await composerSnapshot(cdp);
+  if (!before.ready) return { cleared: false, error: "Codex 输入框尚未出现" };
+  if (before.text.trim() !== expected) {
+    return { cleared: false, error: "采集入队后输入内容发生了变化，已保留输入框内容" };
+  }
+  if (!await selectComposerContents(cdp, false)) {
+    return { cleared: false, error: "无法聚焦 Codex 输入框，已保留输入框内容" };
+  }
+  await cdp.send("Input.insertText", { text: "" });
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const current = await composerSnapshot(cdp);
+    if (current.ready && !current.text.trim()) return { cleared: true };
+    await delay(25);
+  }
+  return { cleared: false, error: "采集已入队，但输入框未能自动清空" };
+}
+
 async function explainNativeOpenFailure(cdp, result, filePath) {
   if (result?.ok === true) return result;
   const context = await nativeWorkspaceContext(cdp);
@@ -444,6 +536,31 @@ async function nativePinTarget(cdp, sessionId) {
   return {
     canonicalPath,
     filePath: path.join(workspacePath, "pins", path.basename(canonicalPath)),
+    workspacePath,
+    mirrored: true,
+  };
+}
+
+async function nativeCollectionResultTarget(cdp, canonicalPath) {
+  const context = await nativeWorkspaceContext(cdp);
+  const candidate = context?.workspacePath?.trim();
+  if (!candidate || !path.isAbsolute(candidate)) {
+    return { canonicalPath, filePath: canonicalPath, workspacePath: root, mirrored: false };
+  }
+  const workspacePath = path.resolve(candidate);
+  try {
+    const info = await stat(workspacePath);
+    if (!info.isDirectory()) throw new Error("workspace is not a directory");
+  } catch {
+    return { canonicalPath, filePath: canonicalPath, workspacePath: root, mirrored: false };
+  }
+  const relative = path.relative(workspacePath, canonicalPath);
+  if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) {
+    return { canonicalPath, filePath: canonicalPath, workspacePath, mirrored: false };
+  }
+  return {
+    canonicalPath,
+    filePath: path.join(workspacePath, "collections", path.basename(canonicalPath)),
     workspacePath,
     mirrored: true,
   };
@@ -504,6 +621,9 @@ function revisionStatePayload(state) {
 }
 
 async function enableRevision(cdp, stateKey, sessionId) {
+  if (collectionModes.get(safeSessionId(sessionId))?.enabled) {
+    throw new Error("采集模式正在使用发送按钮，请先关闭采集模式");
+  }
   const existing = revisionStates.get(stateKey);
   if (existing && existing.sessionId !== sessionId) {
     await syncRevisionTarget(existing).catch(() => {});
@@ -598,6 +718,586 @@ async function finishRevisionTurn(stateKey, sessionId, turnId) {
     baselineHash: turn.baselineHash,
     currentHash: current.hash,
     backupPath: turn.backupPath,
+  };
+}
+
+function collectionQueuePath(sessionId) {
+  return path.join(collectionQueueDirectory, `collection_${safeSessionId(sessionId)}.json`);
+}
+
+function collectionCounts(queue) {
+  const counts = { queued: 0, running: 0, completed: 0, failed: 0 };
+  for (const item of queue?.items || []) {
+    if (Object.hasOwn(counts, item.status)) counts[item.status] += 1;
+  }
+  return counts;
+}
+
+function collectionStatePayload(mode, queue) {
+  const counts = collectionCounts(queue);
+  const runningItem = queue?.items.find((item) => item.status === "running");
+  return {
+    enabled: mode?.enabled === true,
+    sessionId: mode?.sessionId || queue?.sessionId || "",
+    fileName: mode?.fileName || "",
+    sourcePath: mode?.sourcePath || "",
+    workspacePath: mode?.workspacePath || queue?.workspacePath || "",
+    resultPath: "",
+    counts,
+    pendingCount: counts.queued + counts.running,
+    runningItemId: runningItem?.id || "",
+    runningStartedAt: runningItem?.startedAt || "",
+    runningPhase: runningItem?.phase || "",
+    enabledAt: mode?.enabledAt || null,
+    protocolVersion: collectionProtocolVersion,
+    capabilities: collectionCapabilities,
+  };
+}
+
+function persistedCollectionMode(mode) {
+  if (!mode?.enabled || !mode.sessionId || !mode.sourcePath) return null;
+  return {
+    enabled: true,
+    sessionId: safeSessionId(mode.sessionId),
+    sourcePath: path.resolve(mode.sourcePath),
+    workspacePath: mode.workspacePath && path.isAbsolute(mode.workspacePath) ? path.resolve(mode.workspacePath) : "",
+    fileName: mode.fileName || path.basename(mode.sourcePath),
+    enabledAt: Number.isFinite(mode.enabledAt) ? mode.enabledAt : Date.now(),
+  };
+}
+
+async function persistCollectionQueue(queue) {
+  await mkdir(collectionQueueDirectory, { recursive: true });
+  queue.updatedAt = new Date().toISOString();
+  await writePinFile(queue.queuePath, `${JSON.stringify({
+    version: 5,
+    sessionId: queue.sessionId,
+    workspacePath: queue.workspacePath || "",
+    generation: queue.generation,
+    mode: persistedCollectionMode(queue.mode),
+    updatedAt: queue.updatedAt,
+    items: queue.items,
+  }, null, 2)}\n`);
+}
+
+async function loadCollectionQueue(sessionId) {
+  const key = safeSessionId(sessionId);
+  if (collectionQueues.has(key)) return collectionQueues.get(key);
+  if (collectionQueueLoads.has(key)) return collectionQueueLoads.get(key);
+  const pending = (async () => {
+    const queuePath = collectionQueuePath(key);
+    let stored = null;
+    try {
+      stored = JSON.parse(await readFile(queuePath, "utf8"));
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        throw new Error(`采集队列文件无法读取：${error.message}`);
+      }
+    }
+    const items = Array.isArray(stored?.items)
+      ? stored.items.filter((item) => item && typeof item === "object" && typeof item.id === "string")
+      : [];
+    const recovered = recoverCollectionItems(items, stored?.version) > 0;
+    const queue = {
+      sessionId: key,
+      queuePath,
+      resultPath: "",
+      workspacePath: stored?.workspacePath && path.isAbsolute(stored.workspacePath)
+        ? path.resolve(stored.workspacePath)
+        : "",
+      generation: Number.isSafeInteger(stored?.generation) ? stored.generation : 0,
+      mode: persistedCollectionMode(stored?.mode),
+      items,
+      updatedAt: stored?.updatedAt || null,
+    };
+    collectionQueues.set(key, queue);
+    if (recovered) await persistCollectionQueue(queue);
+    return queue;
+  })();
+  collectionQueueLoads.set(key, pending);
+  try {
+    return await pending;
+  } finally {
+    collectionQueueLoads.delete(key);
+  }
+}
+
+async function ensureCollectionBackend() {
+  if (collectionBackend?.child && collectionBackend.child.exitCode === null) return collectionBackend;
+  if (collectionBackendPromise) return collectionBackendPromise;
+  collectionBackendPromise = (async () => {
+    const cli = requireCollectionCli();
+    const probe = await probeCodexCli(cli);
+    if (!probe.ok) {
+      throw new Error(`Codex CLI 检测失败（${probe.stage || "resolve"}）：${probe.error}`);
+    }
+    const client = new CodexAppServerClient({
+      cli,
+      cwd: collectionWorkspaceDirectory,
+      ...collectionRuntimeOptions(),
+    });
+    client.once("exit", () => {
+      if (collectionBackend === client) collectionBackend = null;
+    });
+    await client.start();
+    collectionBackend = client;
+    console.log(`Chat Pin collection backend: ${probe.version || cli.displayPath}`);
+    return client;
+  })();
+  try {
+    return await collectionBackendPromise;
+  } finally {
+    collectionBackendPromise = null;
+  }
+}
+
+function requireCollectionCli() {
+  const cli = resolveCodexCli();
+  if (!cli) {
+    throw new Error("未检测到可用的独立 Codex CLI。请确认 codex --version 和 codex app-server --help 可运行，或设置 CODEX_PIN_CLI_PATH");
+  }
+  return cli;
+}
+
+async function postCollectionEvent(sessionId, event, item = null, result = null) {
+  const queue = await loadCollectionQueue(sessionId);
+  const mode = collectionModes.get(queue.sessionId);
+  if (!mode?.cdp) return;
+  await postHostMessage(mode.cdp, {
+      type: "collection-event",
+      event,
+      sessionId: queue.sessionId,
+      state: collectionStatePayload(mode, queue),
+      item: item ? {
+        id: item.id,
+        status: item.status,
+        error: item.error || "",
+        resultPath: "",
+        input: item.input || "",
+        output: result ? String(result.output || "").slice(0, 6000) : String(item.output || "").slice(0, 6000),
+        truncated: result ? String(result.output || "").length > 6000 : item.outputTruncated === true || String(item.output || "").length > 6000,
+        changedFiles: Array.isArray(item.changedFiles) ? item.changedFiles : [],
+        completedAt: item.completedAt || "",
+        executionProfile: item.executionProfile || null,
+        metrics: item.metrics || null,
+      } : null,
+    }).catch(() => {});
+}
+
+async function collectionResultsForQueue(queue) {
+  return (queue?.items || [])
+    .filter((item) => item.status === "completed" && String(item.output || "").trim())
+    .slice(-20)
+    .map((item) => ({
+      id: item.id,
+      input: item.input || "",
+      output: String(item.output || "").slice(0, 6000),
+      truncated: item.outputTruncated === true || String(item.output || "").length > 6000,
+      changedFiles: Array.isArray(item.changedFiles) ? item.changedFiles : [],
+      completedAt: item.completedAt || "",
+      executionProfile: item.executionProfile || null,
+      metrics: item.metrics || null,
+    }));
+}
+
+function nextQueuedCollectionItem() {
+  for (const queue of collectionQueues.values()) {
+    const item = queue.items.find((candidate) => candidate.status === "queued");
+    if (item) return { queue, item };
+  }
+  return null;
+}
+
+async function processCollectionItem(queue, item) {
+  const generation = queue.generation;
+  const controller = new AbortController();
+  collectionItemControllers.set(item.id, controller);
+  const processStartedAt = Date.now();
+  const terminalState = { lastActivity: "starting", toolEvents: 0, fileChanges: 0 };
+  const heartbeat = setInterval(() => {
+    collectionTerminalLog(
+      item,
+      `HEARTBEAT ${collectionDuration(Date.now() - processStartedAt)} | phase=${item.phase || item.status} | last=${terminalState.lastActivity} | tools=${terminalState.toolEvents} | files=${terminalState.fileChanges}`,
+    );
+  }, 20_000);
+  heartbeat.unref?.();
+  try {
+    item.status = "running";
+    item.startedAt = new Date().toISOString();
+    item.phase = "preparing";
+    item.error = "";
+    await persistCollectionQueue(queue);
+    await postCollectionEvent(queue.sessionId, "item-started", item);
+    if (!collectionItemIsCurrent(queue, item, generation)) return;
+    const workspacePath = item.workspacePath || queue.workspacePath || collectionWorkspaceDirectory;
+    collectionTerminalLog(item, `START | rule=${path.basename(item.sourcePath || "pin.md")} | workspace=${workspacePath}`);
+    const [backend, preflight] = await Promise.all([
+      ensureCollectionBackend(),
+      prepareCollectionPreflight({
+        workspacePath,
+        sourceMarkdown: item.sourceMarkdown || item.pinMarkdown,
+        userInput: item.input,
+      }),
+    ]);
+    if (!collectionItemIsCurrent(queue, item, generation)) return;
+    const executionProfile = selectCollectionExecutionProfile(
+      preflight,
+      item.sourceMarkdown || item.pinMarkdown,
+      item.input,
+      process.env,
+      item.desktopExecutionPreference || null,
+    );
+    terminalState.lastActivity = "preflight-complete";
+    collectionTerminalLog(
+      item,
+      `PREFLIGHT ${collectionDuration(preflight.durationMs)} | urls=${preflight.metadata?.urls?.length || 0} | workspace-matches=${preflight.workspaceSearch?.matches?.length || 0} | github-checks=${preflight.githubVerification?.length || 0}`,
+    );
+    collectionTerminalLog(
+      item,
+      `MODEL ${executionProfile.model || "CLI default"} / ${executionProfile.effort || "default"} | source=${executionProfile.profile}`,
+    );
+    item.executionProfile = executionProfile;
+    item.phase = "starting-turn";
+    item.preflightSummary = {
+      durationMs: preflight.durationMs,
+      urlCount: preflight.metadata?.urls?.length || 0,
+      githubRepositoryCount: preflight.metadata?.githubRepositories?.length || 0,
+      workspaceMatchCount: preflight.workspaceSearch?.matches?.length || 0,
+      githubVerificationCount: preflight.githubVerification?.length || 0,
+      truncated: preflight.workspaceSearch?.truncated === true,
+    };
+    await persistCollectionQueue(queue);
+    const result = await backend.runFreshCollection({
+      cwd: workspacePath,
+      prompt: collectionPrompt(item.sourceMarkdown || item.pinMarkdown, item.input, preflight),
+      model: executionProfile.model,
+      effort: executionProfile.effort,
+      signal: controller.signal,
+      onProgress: (event) => {
+        if (!event?.type) return;
+        if (event.type === "app-server-ready") {
+          terminalState.lastActivity = "app-server-ready";
+          collectionTerminalLog(item, `APP SERVER ready in ${collectionDuration(event.elapsedMs)}`);
+          return;
+        }
+        if (event.type === "thread-started") {
+          terminalState.lastActivity = "thread-started";
+          collectionTerminalLog(item, `THREAD started | id=${String(event.threadId || "").slice(-12)}`);
+          return;
+        }
+        if (event.type === "turn-started") {
+          terminalState.lastActivity = "turn-started";
+          collectionTerminalLog(item, `TURN started | model=${event.model || "CLI default"} | effort=${event.effort || "default"}`);
+          return;
+        }
+        if (event.type === "model-fallback") {
+          terminalState.lastActivity = "model-fallback";
+          collectionTerminalLog(item, `MODEL FALLBACK at ${event.stage}; retrying with CLI defaults | ${String(event.error || "").slice(0, 240)}`, "warn");
+          return;
+        }
+        if (event.type === "retry") {
+          terminalState.lastActivity = "transport-retry";
+          collectionTerminalLog(item, `RETRY | ${String(event.error || "Codex is reconnecting").slice(0, 300)}`, "warn");
+          return;
+        }
+        if (event.type === "item") {
+          terminalState.lastActivity = `${event.itemType || "item"}-${event.event || "event"}`;
+          if (event.event === "started" && !["agentMessage", "reasoning"].includes(event.itemType)) {
+            terminalState.toolEvents += 1;
+            if (terminalState.toolEvents <= 3 || terminalState.toolEvents % 10 === 0) {
+              collectionTerminalLog(item, `TOOL #${terminalState.toolEvents} started | type=${event.itemType || "unknown"}`);
+            }
+          }
+          if (event.itemType === "contextCompaction" && event.event === "completed") {
+            collectionTerminalLog(item, "CONTEXT compacted");
+          }
+          if (event.itemType === "fileChange" && event.event === "completed") {
+            const changes = Array.isArray(event.changes) ? event.changes : [];
+            terminalState.fileChanges += changes.length;
+            for (const change of changes.slice(0, 12)) {
+              collectionTerminalLog(item, `WRITE ${change.kind || "change"} | ${change.path}`);
+            }
+            if (changes.length > 12) collectionTerminalLog(item, `WRITE +${changes.length - 12} additional paths`);
+          }
+          return;
+        }
+        if (event.type === "turn-completed") {
+          terminalState.lastActivity = "turn-completed";
+          collectionTerminalLog(item, `TURN completed | status=${event.status || "completed"}`);
+        }
+      },
+      onTurnStarted: async ({ threadId, turnId }) => {
+        if (!collectionItemIsCurrent(queue, item, generation)) {
+          controller.abort();
+          return;
+        }
+        item.threadId = threadId || null;
+        item.turnId = turnId || null;
+        item.phase = "executing";
+        await persistCollectionQueue(queue);
+        await postCollectionEvent(queue.sessionId, "item-progress", item);
+      },
+    });
+    if (!collectionItemIsCurrent(queue, item, generation)) return;
+    item.threadId = result.threadId;
+    item.turnId = result.turnId;
+    if (result.executionProfile) {
+      item.executionProfile = {
+        ...executionProfile,
+        effectiveModel: result.executionProfile.model || "inherited",
+        effectiveEffort: result.executionProfile.effort || "inherited",
+        fallback: result.executionProfile.fallback === true,
+      };
+    }
+    item.completedAt = new Date().toISOString();
+    item.output = String(result.output || "").slice(0, 12_000);
+    item.outputTruncated = String(result.output || "").length > 12_000;
+    item.changedFiles = Array.isArray(result.fileChanges) ? result.fileChanges.slice(0, 200) : [];
+    item.metrics = {
+      preflightMs: preflight.durationMs,
+      totalMs: Date.now() - processStartedAt,
+      ...(result.metrics || {}),
+    };
+    item.status = "completed";
+    item.phase = "completed";
+    item.resultPath = "";
+    await persistCollectionQueue(queue);
+    await postCollectionEvent(queue.sessionId, "item-completed", item, result);
+    collectionTerminalLog(
+      item,
+      `DONE ${collectionDuration(Date.now() - processStartedAt)} | files=${item.changedFiles.length} | model=${item.executionProfile?.effectiveModel || item.executionProfile?.model || "CLI default"}`,
+    );
+  } catch (error) {
+    if (!collectionItemIsCurrent(queue, item, generation)) {
+      collectionTerminalLog(item, `CANCELLED ${collectionDuration(Date.now() - processStartedAt)} | queue was cleared or replaced`, "warn");
+      return;
+    }
+    item.status = "failed";
+    item.phase = "failed";
+    item.completedAt = new Date().toISOString();
+    item.error = error.message || String(error);
+    await persistCollectionQueue(queue).catch(() => {});
+    await postCollectionEvent(queue.sessionId, "item-failed", item);
+    collectionTerminalLog(item, `FAILED ${collectionDuration(Date.now() - processStartedAt)} | ${String(item.error).slice(0, 500)}`, "error");
+  } finally {
+    clearInterval(heartbeat);
+    if (collectionItemControllers.get(item.id) === controller) collectionItemControllers.delete(item.id);
+  }
+}
+
+function scheduleCollectionPump() {
+  if (collectionPump) return collectionPump;
+  collectionPump = (async () => {
+    let next;
+    while ((next = nextQueuedCollectionItem())) {
+      await processCollectionItem(next.queue, next.item);
+    }
+  })().finally(() => {
+    collectionPump = null;
+    if (nextQueuedCollectionItem()) scheduleCollectionPump();
+  });
+  return collectionPump;
+}
+
+async function collectionSource(cdp, sessionId, sourceFileName = "") {
+  const canonicalPath = pinFileFor(sessionId);
+  const requested = String(sourceFileName || "").trim();
+  if (!requested || requested.toLowerCase() === path.basename(canonicalPath).toLowerCase()) {
+    await stat(canonicalPath).catch((error) => {
+      if (error.code === "ENOENT") throw new Error("当前任务还没有 Pin 文件，请先 Pin 一条助手回复");
+      throw error;
+    });
+    return canonicalPath;
+  }
+  const context = await nativeWorkspaceContext(cdp);
+  const workspacePath = String(context?.workspacePath || "").trim();
+  return resolveCollectionSourceInWorkspace(workspacePath, requested);
+}
+
+async function collectionTaskWorkspace(cdp) {
+  const context = await nativeWorkspaceContext(cdp);
+  const candidate = String(context?.workspacePath || "").trim();
+  if (!candidate || !path.isAbsolute(candidate)) {
+    throw new Error("当前任务没有可确认的本地工作区，无法执行采集规则");
+  }
+  const workspacePath = path.resolve(candidate);
+  const info = await stat(workspacePath).catch(() => null);
+  if (!info?.isDirectory()) throw new Error(`当前任务工作区不可用：${workspacePath}`);
+  return workspacePath;
+}
+
+async function assignCollectionWorkspace(queue, workspacePath) {
+  queue.workspacePath = workspacePath;
+  queue.resultPath = "";
+}
+
+async function enableCollection(cdp, stateKey, sessionId, sourceFileName = "") {
+  if (revisionStates.get(stateKey)) {
+    throw new Error("修订模式正在使用发送按钮，请先关闭修订模式");
+  }
+  const sourcePath = await collectionSource(cdp, sessionId, sourceFileName);
+  const workspacePath = await collectionTaskWorkspace(cdp);
+  // Enabling collection mode is a local state transition and must remain fast.
+  // Starting and probing App Server can take tens of seconds on a cold machine;
+  // defer that work until an item is actually queued so the UI cannot time out
+  // with an unpersisted mode. A missing CLI is still reported immediately.
+  requireCollectionCli();
+  const queue = await loadCollectionQueue(sessionId);
+  await assignCollectionWorkspace(queue, workspacePath);
+  const mode = {
+    enabled: true,
+    cdp,
+    sessionId: safeSessionId(sessionId),
+    sourcePath,
+    workspacePath,
+    fileName: path.basename(sourcePath),
+    enabledAt: Date.now(),
+  };
+  queue.mode = persistedCollectionMode(mode);
+  collectionModes.set(mode.sessionId, mode);
+  await persistCollectionQueue(queue);
+  if (queue.items.some((item) => item.status === "queued")) scheduleCollectionPump();
+  return collectionStatePayload(mode, queue);
+}
+
+async function disableCollection(_stateKey, sessionId) {
+  const safeId = safeSessionId(sessionId);
+  const queue = await loadCollectionQueue(safeId);
+  collectionModes.delete(safeId);
+  queue.mode = null;
+  await persistCollectionQueue(queue);
+  return collectionStatePayload(null, queue);
+}
+
+async function currentCollectionState(cdp, _stateKey, sessionId) {
+  const safeId = safeSessionId(sessionId);
+  const queue = await loadCollectionQueue(safeId);
+  let mode = collectionModes.get(safeId);
+  if (!mode && queue.mode?.enabled) {
+    const sourceExists = await stat(queue.mode.sourcePath).then(() => true, () => false);
+    if (sourceExists) {
+      mode = { ...queue.mode, cdp };
+      collectionModes.set(safeId, mode);
+    } else {
+      queue.mode = null;
+      await persistCollectionQueue(queue);
+    }
+  }
+  if (mode) {
+    const workspacePath = await collectionTaskWorkspace(cdp);
+    await assignCollectionWorkspace(queue, workspacePath);
+    mode.cdp = cdp;
+    mode.workspacePath = workspacePath;
+    queue.mode = persistedCollectionMode(mode);
+    await persistCollectionQueue(queue);
+  }
+  if (queue.items.some((item) => item.status === "queued")) scheduleCollectionPump();
+  return collectionStatePayload(mode, queue);
+}
+
+async function retryFailedCollection(stateKey, sessionId) {
+  const safeId = safeSessionId(sessionId);
+  const mode = collectionModes.get(safeId);
+  if (!mode?.enabled || mode.sessionId !== safeId) throw new Error("当前任务没有启用采集模式");
+  const queue = await loadCollectionQueue(safeId);
+  const retriedAt = new Date().toISOString();
+  const retriedCount = retryFailedCollectionItems(queue.items, retriedAt);
+  if (retriedCount) {
+    await persistCollectionQueue(queue);
+    scheduleCollectionPump();
+  }
+  return { ...collectionStatePayload(mode, queue), retriedCount };
+}
+
+async function clearCollectionQueue(stateKey, sessionId) {
+  const safeId = safeSessionId(sessionId);
+  const mode = collectionModes.get(safeId);
+  if (!mode?.enabled || mode.sessionId !== safeId) throw new Error("当前任务没有启用采集模式");
+  const queue = await loadCollectionQueue(safeId);
+  for (const item of queue.items) collectionItemControllers.get(item.id)?.abort();
+  const clearedCount = clearCollectionItems(queue);
+  await persistCollectionQueue(queue);
+  await postCollectionEvent(safeId, "queue-cleared");
+  return { ...collectionStatePayload(mode, queue), clearedCount };
+}
+
+async function clearCollectionReports(_stateKey, sessionId) {
+  const safeId = safeSessionId(sessionId);
+  const queue = await loadCollectionQueue(safeId);
+  const clearedReportCount = clearCompletedCollectionItems(queue);
+  if (clearedReportCount) await persistCollectionQueue(queue);
+  const mode = collectionModes.get(safeId) || null;
+  return { ...collectionStatePayload(mode, queue), clearedReportCount };
+}
+
+async function openCollectionResult(cdp, stateKey, sessionId) {
+  await currentCollectionState(cdp, stateKey, sessionId);
+  throw new Error("当前采集模式会直接修改任务工作区，不再生成独立采集结果文件；请查看执行报告和项目文件");
+}
+
+async function enqueueCollection(
+  cdp,
+  stateKey,
+  sessionId,
+  userInput,
+  composerAlreadyCleared = false,
+  desktopExecutionLabel = "",
+) {
+  const safeId = safeSessionId(sessionId);
+  await currentCollectionState(cdp, stateKey, safeId);
+  const mode = collectionModes.get(safeId);
+  if (!mode?.enabled || mode.sessionId !== safeId) throw new Error("当前任务没有启用采集模式");
+  if (revisionStates.get(stateKey)) throw new Error("修订模式与采集模式不能同时发送");
+  const input = String(userInput || "").trim();
+  if (!input) throw new Error("请输入本次采集要求");
+  const sourcePath = mode.sourcePath || pinFileFor(safeId);
+  const sourceMarkdown = await readFile(sourcePath, "utf8").catch((error) => {
+    if (error.code === "ENOENT") throw new Error("当前采集规则文件已经不存在，采集模式已关闭");
+    throw error;
+  });
+  if (!sourceMarkdown.trim()) throw new Error("当前采集规则文件是空的，无法加入采集队列");
+  const queue = await loadCollectionQueue(safeId);
+  const item = {
+    id: `collect_${Date.now()}_${randomUUID().slice(0, 8)}`,
+    status: "queued",
+    sessionId: safeId,
+    input,
+    desktopExecutionPreference: parseDesktopExecutionPreference(desktopExecutionLabel),
+    sourcePath,
+    workspacePath: mode.workspacePath,
+    sourceHash: contentHash(sourceMarkdown),
+    sourceMarkdown,
+    createdAt: new Date().toISOString(),
+    startedAt: null,
+    completedAt: null,
+    threadId: null,
+    turnId: null,
+    resultPath: "",
+    error: "",
+    output: "",
+    outputTruncated: false,
+    changedFiles: [],
+    executionProfile: null,
+    preflightSummary: null,
+    metrics: null,
+    phase: "queued",
+  };
+  queue.items.push(item);
+  await persistCollectionQueue(queue);
+  const pendingPosition = queue.items.filter((candidate) => ["queued", "running"].includes(candidate.status)).length;
+  collectionTerminalLog(
+    item,
+    `QUEUED | rule=${path.basename(sourcePath)} | workspace=${mode.workspacePath} | pending=${pendingPosition}`,
+  );
+  const composer = composerAlreadyCleared
+    ? { cleared: true, method: "injection" }
+    : await clearCollectionComposer(cdp, input);
+  scheduleCollectionPump();
+  return {
+    ...collectionStatePayload(mode, queue),
+    accepted: true,
+    composer,
+    item: { id: item.id, status: item.status },
   };
 }
 
@@ -1134,7 +1834,50 @@ async function inject(browser, known) {
         const revisionAction = typeof change.type === "string" && change.type.startsWith("revision-")
           ? change.type.slice("revision-".length)
           : "";
-        if (revisionAction) {
+        const collectionAction = typeof change.type === "string" && change.type.startsWith("collection-")
+          ? change.type.slice("collection-".length)
+          : "";
+        if (collectionAction) {
+          let state;
+          if (collectionAction === "enable") {
+            state = await enableCollection(cdp, target.targetId, sessionId, String(change.sourceFileName || ""));
+          } else if (collectionAction === "disable") {
+            state = await disableCollection(target.targetId, sessionId);
+          } else if (collectionAction === "status") {
+            state = await currentCollectionState(cdp, target.targetId, sessionId);
+          } else if (collectionAction === "enqueue") {
+            state = await enqueueCollection(
+              cdp,
+              target.targetId,
+              sessionId,
+              String(change.input || ""),
+              change.composerCleared === true,
+              String(change.desktopExecutionLabel || ""),
+            );
+          } else if (collectionAction === "retry") {
+            state = await retryFailedCollection(target.targetId, sessionId);
+          } else if (collectionAction === "clear") {
+            state = await clearCollectionQueue(target.targetId, sessionId);
+          } else if (collectionAction === "clear-reports") {
+            state = await clearCollectionReports(target.targetId, sessionId);
+          } else if (collectionAction === "open-result") {
+            state = await openCollectionResult(cdp, target.targetId, sessionId);
+          } else {
+            throw new Error(`未知采集操作：${collectionAction}`);
+          }
+          if (["status", "enable", "disable", "clear", "clear-reports"].includes(collectionAction)) {
+            const queue = await loadCollectionQueue(sessionId);
+            state = { ...state, results: await collectionResultsForQueue(queue) };
+          }
+          await postHostMessage(cdp, {
+            type: "collection-result",
+            action: collectionAction,
+            requestId: change.requestId,
+            sessionId,
+            ok: true,
+            state,
+          });
+        } else if (revisionAction) {
           let state;
           if (revisionAction === "enable") {
             state = await enableRevision(cdp, target.targetId, sessionId);
@@ -1169,6 +1912,14 @@ async function inject(browser, known) {
           const activeRevision = revisionStates.get(target.targetId);
           const revisionDisabled = activeRevision?.sessionId === sessionId;
           if (revisionDisabled) revisionStates.delete(target.targetId);
+          const activeCollection = collectionModes.get(sessionId);
+          const collectionDisabled = activeCollection?.sessionId === sessionId;
+          if (collectionDisabled) {
+            collectionModes.delete(sessionId);
+            const collectionQueue = await loadCollectionQueue(sessionId);
+            collectionQueue.mode = null;
+            await persistCollectionQueue(collectionQueue);
+          }
           await mkdir(pinDirectory, { recursive: true });
           await writePinFile(canonicalPinFilePath, change.text);
           let openResult = null;
@@ -1209,6 +1960,7 @@ async function inject(browser, known) {
             fileName: path.basename(canonicalPinFilePath),
             openResult,
             revisionDisabled,
+            collectionDisabled,
           });
         } else if (change.type === "open") {
           let openResult;
@@ -1281,9 +2033,11 @@ async function inject(browser, known) {
         console.error(`Chat Pin persistence failed: ${error.message}`);
         if (change?.requestId) {
           const isRevision = typeof change.type === "string" && change.type.startsWith("revision-");
+          const isCollection = typeof change.type === "string" && change.type.startsWith("collection-");
           await postHostMessage(cdp, {
-            type: isRevision ? "revision-result" : change.type === "load" ? "load-result" : "save-result",
+            type: isRevision ? "revision-result" : isCollection ? "collection-result" : change.type === "load" ? "load-result" : "save-result",
             ...(isRevision ? { action: change.type.slice("revision-".length) } : {}),
+            ...(isCollection ? { action: change.type.slice("collection-".length) } : {}),
             requestId: change.requestId,
             sessionId: safeSessionId(change.sessionId),
             ok: false,
@@ -1331,7 +2085,15 @@ function stopManagedCodex() {
   child.kill("SIGTERM");
 }
 
-process.once("exit", stopManagedCodex);
+function stopCollectionBackend() {
+  void collectionBackend?.stop();
+  collectionBackend = null;
+}
+
+process.once("exit", () => {
+  stopCollectionBackend();
+  stopManagedCodex();
+});
 
 try {
   if (!shouldLaunch) throw new Error("Existing Codex windows cannot be injected without CDP. Use: npm start");
@@ -1379,6 +2141,7 @@ try {
     clearInterval(interval);
     for (const { cdp } of known.values()) cdp.close();
     browser?.close();
+    stopCollectionBackend();
     stopManagedCodex();
     process.exit(0);
   };
@@ -1392,6 +2155,7 @@ try {
     : error.message;
   console.error(`Chat Pin launcher: ${message}`);
   browser?.close();
+  stopCollectionBackend();
   stopManagedCodex();
   process.exitCode = 1;
 }

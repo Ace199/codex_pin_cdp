@@ -1,13 +1,18 @@
 (() => {
   "use strict";
 
-  const VERSION = "0.7.1"; // Hidden-at-submit revision constraints with a visible mode indicator.
+  const VERSION = "0.9.3"; // Collection terminal progress and heartbeat release.
   const API_KEY = "__codexChatPinInjection__";
   const STYLE_ID = "codex-chat-pin-style";
   const BUTTON_ATTRIBUTE = "data-codex-chat-pin-button";
   const OPEN_ATTRIBUTE = "data-codex-chat-pin-open";
   const REVISION_ATTRIBUTE = "data-codex-chat-pin-revision";
   const REVISION_CARD_ATTRIBUTE = "data-codex-chat-pin-revision-card";
+  const COLLECTION_ATTRIBUTE = "data-codex-chat-pin-collection";
+  const COLLECTION_CARD_ATTRIBUTE = "data-codex-chat-pin-collection-card";
+  const COLLECTION_RESULTS_ATTRIBUTE = "data-codex-chat-pin-collection-results";
+  const COLLECTION_SEND_GUARD_ATTRIBUTE = "data-codex-chat-pin-native-send-guard";
+  const COLLECTION_SEND_OVERLAY_ATTRIBUTE = "data-codex-chat-pin-send-overlay";
   const HIGHLIGHT_CLASS = "codex-chat-pin-source";
   const REVISION_MARKER = "[Chat Pin 修订模式]";
   const PIN_ICON = `<svg viewBox="0 0 1024 1024" aria-hidden="true"><path d="M648.728381 130.779429a73.142857 73.142857 0 0 1 22.674286 15.433142l191.561143 191.756191a73.142857 73.142857 0 0 1-22.137905 118.564571l-67.876572 30.061715-127.341714 127.488-10.093714 140.239238a73.142857 73.142857 0 0 1-124.684191 46.445714l-123.66019-123.782095-210.724572 211.699809-51.833904-51.614476 210.846476-211.821714-127.926857-128.024381a73.142857 73.142857 0 0 1 46.299428-124.635429l144.237715-10.776381 125.074285-125.220571 29.379048-67.779048a73.142857 73.142857 0 0 1 96.207238-38.034285z m-29.086476 67.120761l-34.913524 80.530286-154.087619 154.331429-171.398095 12.751238 303.323428 303.542857 12.044191-167.399619 156.233143-156.428191 80.384-35.59619-191.585524-191.73181z"/></svg>`;
@@ -24,15 +29,25 @@
   let identity = currentSessionIdentity();
   let lastPinnedFingerprint = "";
   let lastOpenResult = null;
+  const guardedNativeSendState = new WeakMap();
   const pendingSaves = new Map();
   const pendingOpens = new Set();
   const pendingRevisionRequests = new Map();
+  const pendingCollectionRequests = new Map();
   const contentCache = new WeakMap();
   let revisionState = { enabled: false };
   let revisionTurn = null;
   let bypassRevisionSubmit = false;
   let revisionStatusSessionId = "";
   let revisionCleanupPending = false;
+  let collectionState = { enabled: false };
+  let collectionResults = [];
+  let collectionResultsHidden = false;
+  let collectionResultsCollapsed = false;
+  const collectionResultOpenState = new Map();
+  let collectionStatusSessionId = "";
+  let collectionStatusPollTimer;
+  let collectionSubmitting = false;
 
   const visible = (node) => node?.isConnected && node.getClientRects().length > 0;
   const norm = (value) => String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
@@ -127,6 +142,14 @@
       revisionState = { enabled: false };
       revisionTurn = null;
       revisionStatusSessionId = "";
+      collectionState = { enabled: false };
+      collectionResults = [];
+      collectionResultsHidden = false;
+      collectionResultsCollapsed = false;
+      collectionResultOpenState.clear();
+      collectionStatusSessionId = "";
+      clearTimeout(collectionStatusPollTimer);
+      collectionStatusPollTimer = undefined;
     }
     return identity;
   }
@@ -159,6 +182,28 @@
     });
   }
 
+  function requestCollection(action, payload = {}, timeoutMs = 12_000) {
+    updateIdentity();
+    const requestId = `collection-${action}-${Date.now()}-${++requestSequence}`;
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        pendingCollectionRequests.delete(requestId);
+        reject(new Error("Pin 启动器没有响应采集请求"));
+      }, timeoutMs);
+      pendingCollectionRequests.set(requestId, { action, resolve, reject, timeout });
+      if (!hostRequest({
+        type: `collection-${action}`,
+        requestId,
+        sessionId: identity.id,
+        ...payload,
+      })) {
+        clearTimeout(timeout);
+        pendingCollectionRequests.delete(requestId);
+        reject(new Error("Pin 启动器未连接"));
+      }
+    });
+  }
+
   function applyRevisionState(value) {
     const next = value?.enabled === true && value.sessionId === identity.id
       ? value
@@ -167,6 +212,52 @@
     if (!next.enabled) revisionTurn = null;
     schedule();
     return next;
+  }
+
+  function applyCollectionState(value) {
+    if (Array.isArray(value?.results)) {
+      collectionResults = value.results;
+      const retained = new Set(collectionResults.map((item) => String(item?.id || "")));
+      for (const id of collectionResultOpenState.keys()) {
+        if (!retained.has(id)) collectionResultOpenState.delete(id);
+      }
+      if (collectionResults.length === 0) collectionResultsCollapsed = false;
+    }
+    const next = value?.enabled === true && value.sessionId === identity.id
+      ? value
+      : { enabled: false, ...(value?.counts ? {
+        counts: value.counts,
+        pendingCount: value.pendingCount,
+        resultPath: value.resultPath,
+        protocolVersion: value.protocolVersion,
+        capabilities: value.capabilities,
+      } : {}) };
+    collectionState = next;
+    guardNativeCollectionSend();
+    scheduleCollectionStatusPoll();
+    schedule();
+    return next;
+  }
+
+  function scheduleCollectionStatusPoll(delayMs = 2_000) {
+    clearTimeout(collectionStatusPollTimer);
+    collectionStatusPollTimer = undefined;
+    if (!collectionState.enabled || Number(collectionState.pendingCount || 0) <= 0) return;
+    const sessionId = identity.id;
+    collectionStatusPollTimer = setTimeout(() => {
+      collectionStatusPollTimer = undefined;
+      updateIdentity();
+      if (identity.id !== sessionId || !collectionState.enabled || Number(collectionState.pendingCount || 0) <= 0) return;
+      // Runtime events are the fast path. Polling is a bounded reconciliation
+      // path for renderer reloads or missed CDP events so "running" cannot
+      // remain stuck after the queue has already completed or been cleared.
+      collectionStatusSessionId = "";
+      void syncCollectionStatus();
+    }, delayMs);
+  }
+
+  function collectionSupports(capability) {
+    return Array.isArray(collectionState.capabilities) && collectionState.capabilities.includes(capability);
   }
 
   async function syncRevisionStatus() {
@@ -182,6 +273,23 @@
     }
   }
 
+  async function syncCollectionStatus() {
+    updateIdentity();
+    if (collectionStatusSessionId === identity.id) return;
+    collectionStatusSessionId = identity.id;
+    try {
+      const message = await requestCollection("status");
+      applyCollectionState(message.state);
+    } catch {
+      collectionStatusSessionId = "";
+      // Preserve an already-active local mode while the launcher connection is
+      // briefly unavailable. Disabling it here would release the native send
+      // guard and could route one input to the Desktop conversation.
+      if (!collectionState.enabled) collectionState = { enabled: false };
+      scheduleCollectionStatusPoll();
+    }
+  }
+
   function style() {
     if (document.getElementById(STYLE_ID)) return;
     const node = document.createElement("style");
@@ -192,12 +300,36 @@
       [${OPEN_ATTRIBUTE}="true"] svg{width:18px;height:18px;fill:currentColor}
       [${REVISION_ATTRIBUTE}="true"][aria-pressed="true"]{color:#8fb3ff!important;background:#6798ff20!important}
       [${REVISION_ATTRIBUTE}="true"]{white-space:nowrap}
+      [${COLLECTION_ATTRIBUTE}="true"][aria-pressed="true"]{color:#9aebca!important;background:#287a5b55!important;box-shadow:inset 0 0 0 1px #65d6a688!important;font-weight:650!important}
+      [${COLLECTION_ATTRIBUTE}="true"][aria-pressed="true"]::before{content:"●";color:#65d6a6;font-size:9px;margin-right:6px}
+      [${COLLECTION_ATTRIBUTE}="true"]{white-space:nowrap}
+      [${COLLECTION_SEND_GUARD_ATTRIBUTE}="true"]{pointer-events:none!important;opacity:1!important}
+      [${COLLECTION_SEND_OVERLAY_ATTRIBUTE}="true"]{position:fixed!important;z-index:2147483647!important;margin:0!important;padding:0!important;border:0!important;border-radius:999px!important;background:transparent!important;color:transparent!important;cursor:pointer!important}
+      [${COLLECTION_SEND_OVERLAY_ATTRIBUTE}="true"]:focus-visible{outline:2px solid #65d6a6!important;outline-offset:2px!important}
       .${HIGHLIGHT_CLASS}{outline:1px solid #6798ff88;outline-offset:4px;border-radius:7px}
       [${REVISION_CARD_ATTRIBUTE}="true"]{display:flex;align-items:center;gap:8px;margin:0 10px 8px;padding:7px 10px;border:1px solid #6798ff55;border-radius:8px;background:#6798ff14;color:inherit;font:12px/1.4 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
       [${REVISION_CARD_ATTRIBUTE}="true"] .codex-chat-pin-revision-label{font-weight:600;color:#9fbdff}
       [${REVISION_CARD_ATTRIBUTE}="true"] .codex-chat-pin-revision-file{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
       [${REVISION_CARD_ATTRIBUTE}="true"] button{margin-left:auto;border:0;background:transparent;color:inherit;cursor:pointer;padding:2px 5px;border-radius:4px}
       [${REVISION_CARD_ATTRIBUTE}="true"] button:hover{background:#ffffff14}
+      [${COLLECTION_CARD_ATTRIBUTE}="true"]{display:flex;align-items:center;gap:8px;margin:0 10px 8px;padding:7px 10px;border:1px solid #49b98955;border-radius:8px;background:#49b98914;color:inherit;font:12px/1.4 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+      [${COLLECTION_CARD_ATTRIBUTE}="true"] .codex-chat-pin-collection-label{font-weight:600;color:#8be0bd}
+      [${COLLECTION_CARD_ATTRIBUTE}="true"] .codex-chat-pin-collection-file{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      [${COLLECTION_CARD_ATTRIBUTE}="true"] .codex-chat-pin-collection-error{color:#ff9c94;white-space:nowrap}
+      [${COLLECTION_CARD_ATTRIBUTE}="true"] .codex-chat-pin-collection-actions{margin-left:auto;display:flex;align-items:center;gap:3px;white-space:nowrap}
+      [${COLLECTION_CARD_ATTRIBUTE}="true"] button{border:0;background:transparent;color:inherit;cursor:pointer;padding:2px 5px;border-radius:4px}
+      [${COLLECTION_CARD_ATTRIBUTE}="true"] button:hover{background:#ffffff14}
+      [${COLLECTION_CARD_ATTRIBUTE}="true"] button:disabled{opacity:.4;cursor:default;background:transparent}
+      [${COLLECTION_CARD_ATTRIBUTE}="true"] [data-collection-action="retry"]{color:#ffb0aa}
+      [${COLLECTION_RESULTS_ATTRIBUTE}="true"]{margin:0 10px 8px;padding:10px;border:1px solid #49b98945;border-radius:10px;background:#1f312aee;color:inherit;font:12px/1.45 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;max-height:42vh;overflow:auto}
+      [${COLLECTION_RESULTS_ATTRIBUTE}="true"] .codex-chat-pin-results-header{display:flex;align-items:center;gap:8px;margin-bottom:7px;font-weight:650;color:#8be0bd}
+      [${COLLECTION_RESULTS_ATTRIBUTE}="true"] .codex-chat-pin-results-actions{margin-left:auto;display:flex;align-items:center;gap:3px;white-space:nowrap}
+      [${COLLECTION_RESULTS_ATTRIBUTE}="true"] details{border-top:1px solid #ffffff12;padding:6px 0}
+      [${COLLECTION_RESULTS_ATTRIBUTE}="true"] summary{cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+      [${COLLECTION_RESULTS_ATTRIBUTE}="true"] .codex-chat-pin-results-files{margin:6px 0;color:#b9d9ca;white-space:pre-wrap;overflow-wrap:anywhere}
+      [${COLLECTION_RESULTS_ATTRIBUTE}="true"] pre{margin:7px 0 3px;padding:9px;border-radius:7px;background:#00000028;white-space:pre-wrap;overflow-wrap:anywhere;max-height:280px;overflow:auto;font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}
+      [${COLLECTION_RESULTS_ATTRIBUTE}="true"] button{border:0;background:transparent;color:inherit;cursor:pointer;padding:2px 5px;border-radius:4px}
+      [${COLLECTION_RESULTS_ATTRIBUTE}="true"] button:hover{background:#ffffff14}
       [data-codex-chat-pin-submitting="true"] [data-codex-composer="true"][contenteditable="true"],
       [data-codex-chat-pin-submitting="true"] [contenteditable="true"][role="textbox"],
       [data-codex-chat-pin-submitting="true"] textarea{opacity:0!important;caret-color:transparent!important}
@@ -551,22 +683,26 @@
     }
   }
 
-  function activeNativePinTab() {
-    const wanted = norm(fileName());
-    return [...document.querySelectorAll('[role="tab"]')].find((tab) => {
-      if (!visible(tab)) return false;
-      const selected = tab.getAttribute("aria-selected") === "true"
-        || tab.getAttribute("data-state") === "active"
-        || tab.matches("[data-selected='true']");
-      const label = norm(`${tab.textContent} ${tab.getAttribute("aria-label")} ${tab.title}`);
-      return selected && label.includes(wanted);
-    }) || null;
+  function activeNativeMarkdownFile() {
+    const tab = [...document.querySelectorAll('[role="tab"]')].find((candidate) => {
+      if (!visible(candidate)) return false;
+      return candidate.getAttribute("aria-selected") === "true"
+        || candidate.getAttribute("data-state") === "active"
+        || candidate.matches("[data-selected='true']");
+    });
+    if (!tab) return null;
+    const labels = [tab.textContent, tab.getAttribute("aria-label"), tab.title].filter(Boolean);
+    for (const label of labels) {
+      const match = String(label).match(/([^\\/:*?"<>|\r\n]+\.md)\b/i);
+      if (match) return { tab, fileName: match[1].trim() };
+    }
+    return null;
   }
 
   function sourceCodeButtons() {
-    if (!activeNativePinTab()) return [];
+    if (!activeNativeMarkdownFile()) return [];
     return [...document.querySelectorAll("button,a")].filter((node) => {
-      if (!visible(node) || node.hasAttribute(REVISION_ATTRIBUTE)) return false;
+      if (!visible(node) || node.hasAttribute(REVISION_ATTRIBUTE) || node.hasAttribute(COLLECTION_ATTRIBUTE)) return false;
       const labels = [node.textContent, node.getAttribute("aria-label"), node.title].map(norm).filter(Boolean);
       return labels.some((label) => /^(查看源代码|view source(?: code)?)$/.test(label));
     });
@@ -575,6 +711,12 @@
   async function toggleRevision(button) {
     button.disabled = true;
     try {
+      if (!revisionState.enabled && collectionState.enabled) {
+        const confirmed = window.confirm("采集模式正在运行。切换到修订模式会停止接收新的采集请求，是否继续？");
+        if (!confirmed) return;
+        const collectionMessage = await requestCollection("disable");
+        applyCollectionState(collectionMessage.state);
+      }
       const action = revisionState.enabled ? "disable" : "enable";
       const message = await requestRevision(action);
       applyRevisionState(message.state);
@@ -589,34 +731,103 @@
     }
   }
 
-  function addRevisionButtons() {
+  async function toggleCollection(button, sourceFileName) {
+    button.disabled = true;
+    try {
+      const wasEnabled = collectionState.enabled;
+      const sameSource = wasEnabled
+        && norm(collectionState.fileName) === norm(sourceFileName);
+      if (!sameSource && !collectionSupports("workspace-write")) {
+        const statusMessage = await requestCollection("status", {}, 12_000);
+        applyCollectionState(statusMessage.state);
+        if (!collectionSupports("workspace-write")) {
+          throw new Error("启动器仍是旧版只读采集，请完全关闭 ChatGPT_Pin.cmd 和专用 Codex 后重新启动");
+        }
+      }
+      if (!wasEnabled && revisionState.enabled) {
+        const confirmed = window.confirm("修订模式正在运行。切换到采集模式会先关闭修订模式，是否继续？");
+        if (!confirmed) return;
+        const revisionMessage = await requestRevision("disable");
+        applyRevisionState(revisionMessage.state);
+      }
+      const action = sameSource ? "disable" : "enable";
+      const message = await requestCollection(action, action === "enable" ? { sourceFileName } : {}, 20_000);
+      applyCollectionState(message.state);
+      collectionStatusSessionId = identity.id;
+      toast(message.state?.enabled
+        ? `${wasEnabled && !sameSource ? "已切换采集" : "已启用采集"}：${message.state.fileName}`
+        : "已关闭采集模式");
+    } catch (error) {
+      toast(`采集模式切换失败：${error.message}`, "error");
+    } finally {
+      if (button.isConnected) button.disabled = false;
+    }
+  }
+
+  function addModeButtons() {
     const sources = sourceCodeButtons();
-    const valid = new Set();
+    const activeFile = activeNativeMarkdownFile();
+    const activeFileName = activeFile?.fileName || "";
+    const pinFileActive = norm(activeFileName) === norm(fileName());
+    const validRevision = new Set();
+    const validCollection = new Set();
     for (const source of sources) {
       const container = source.parentElement;
       if (!container) continue;
-      let button = container.querySelector(`:scope > [${REVISION_ATTRIBUTE}="true"]`);
-      if (!button) {
-        button = source.cloneNode(true);
-        button.removeAttribute("id");
-        button.querySelectorAll("[id]").forEach((node) => node.removeAttribute("id"));
-        button.setAttribute(REVISION_ATTRIBUTE, "true");
-        button.addEventListener("click", (event) => {
+      let revisionButton = container.querySelector(`:scope > [${REVISION_ATTRIBUTE}="true"]`);
+      if (pinFileActive && !revisionButton) {
+        revisionButton = source.cloneNode(true);
+        revisionButton.removeAttribute("id");
+        revisionButton.querySelectorAll("[id]").forEach((node) => node.removeAttribute("id"));
+        revisionButton.setAttribute(REVISION_ATTRIBUTE, "true");
+        revisionButton.addEventListener("click", (event) => {
           event.preventDefault();
           event.stopPropagation();
-          void toggleRevision(button);
+          void toggleRevision(revisionButton);
         });
-        source.insertAdjacentElement("beforebegin", button);
+        source.insertAdjacentElement("beforebegin", revisionButton);
       }
-      const enabled = revisionState.enabled && revisionState.sessionId === identity.id;
-      button.textContent = enabled ? "修订中" : "修订";
-      button.setAttribute("aria-label", enabled ? "关闭 Pin 文件修订模式" : "启用 Pin 文件修订模式");
-      button.setAttribute("aria-pressed", String(enabled));
-      button.title = enabled ? "关闭修订模式" : "后续消息将直接修改当前 Pin 文件";
-      valid.add(button);
+      if (!pinFileActive && revisionButton) {
+        revisionButton.remove();
+        revisionButton = null;
+      }
+      if (revisionButton) {
+        const revisionEnabled = revisionState.enabled && revisionState.sessionId === identity.id;
+        revisionButton.textContent = revisionEnabled ? "修订中" : "修订";
+        revisionButton.setAttribute("aria-label", revisionEnabled ? "关闭 Pin 文件修订模式" : "启用 Pin 文件修订模式");
+        revisionButton.setAttribute("aria-pressed", String(revisionEnabled));
+        revisionButton.title = revisionEnabled ? "关闭修订模式" : "后续消息将直接修改当前 Pin 文件";
+        validRevision.add(revisionButton);
+      }
+
+      let collectionButton = container.querySelector(`:scope > [${COLLECTION_ATTRIBUTE}="true"]`);
+      if (!collectionButton) {
+        collectionButton = source.cloneNode(true);
+        collectionButton.removeAttribute("id");
+        collectionButton.querySelectorAll("[id]").forEach((node) => node.removeAttribute("id"));
+        collectionButton.setAttribute(COLLECTION_ATTRIBUTE, "true");
+        collectionButton.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          void toggleCollection(collectionButton, collectionButton.dataset.codexCollectionSourceFile || "");
+        });
+        (revisionButton || source).insertAdjacentElement("beforebegin", collectionButton);
+      }
+      collectionButton.dataset.codexCollectionSourceFile = activeFileName;
+      const collectionEnabled = collectionState.enabled
+        && collectionState.sessionId === identity.id
+        && norm(collectionState.fileName) === norm(activeFileName);
+      collectionButton.textContent = collectionEnabled ? "采集中" : "采集";
+      collectionButton.setAttribute("aria-label", collectionEnabled ? "关闭文件采集模式" : "将当前文件用作采集规则");
+      collectionButton.setAttribute("aria-pressed", String(collectionEnabled));
+      collectionButton.title = collectionEnabled ? "关闭采集模式" : `以 ${activeFileName} 为规则，将后续输入作为独立任务落实到当前工作区`;
+      validCollection.add(collectionButton);
     }
     document.querySelectorAll(`[${REVISION_ATTRIBUTE}="true"]`).forEach((button) => {
-      if (!valid.has(button)) button.remove();
+      if (!validRevision.has(button)) button.remove();
+    });
+    document.querySelectorAll(`[${COLLECTION_ATTRIBUTE}="true"]`).forEach((button) => {
+      if (!validCollection.has(button)) button.remove();
     });
   }
 
@@ -629,6 +840,52 @@
     return [...(rootNode?.querySelectorAll(
       '[data-codex-composer="true"][contenteditable="true"],[contenteditable="true"][role="textbox"],textarea',
     ) || [])].find(visible) || null;
+  }
+
+  function composerValue(editor) {
+    if (!editor) return "";
+    return editor instanceof HTMLTextAreaElement ? editor.value : editor.innerText || "";
+  }
+
+  function dispatchComposerInput(editor, text) {
+    try {
+      editor.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        composed: true,
+        inputType: text ? "insertText" : "deleteContentBackward",
+        data: text || null,
+      }));
+    } catch {
+      editor.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    }
+  }
+
+  function replaceComposerValueImmediately(editor, text) {
+    if (!editor?.isConnected) return false;
+    const next = String(text || "");
+    try {
+      editor.focus();
+      if (editor instanceof HTMLTextAreaElement) {
+        const descriptor = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value");
+        if (descriptor?.set) descriptor.set.call(editor, next);
+        else editor.value = next;
+        dispatchComposerInput(editor, next);
+      } else {
+        const selection = getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(editor);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        const changed = document.execCommand(next ? "insertText" : "delete", false, next);
+        if (!changed || composerValue(editor).trim() !== next.trim()) {
+          editor.textContent = next;
+          dispatchComposerInput(editor, next);
+        }
+      }
+      return composerValue(editor).trim() === next.trim();
+    } catch {
+      return false;
+    }
   }
 
   function addRevisionCard() {
@@ -664,6 +921,240 @@
     card.title = `下一条消息将直接修改 ${revisionState.relativePath}`;
   }
 
+  function addCollectionCard() {
+    const enabled = collectionState.enabled && collectionState.sessionId === identity.id;
+    const rootNode = enabled ? threadComposerRoot() : null;
+    const existingCards = [...document.querySelectorAll(`[${COLLECTION_CARD_ATTRIBUTE}="true"]`)];
+    if (!rootNode) {
+      existingCards.forEach((node) => node.remove());
+      return;
+    }
+    let card = existingCards.find((node) => rootNode.contains(node));
+    existingCards.filter((node) => node !== card).forEach((node) => node.remove());
+    if (!card) {
+      card = document.createElement("div");
+      card.setAttribute(COLLECTION_CARD_ATTRIBUTE, "true");
+      card.innerHTML = '<span class="codex-chat-pin-collection-label">采集中</span><span class="codex-chat-pin-collection-file"></span><span class="codex-chat-pin-collection-error"></span><span class="codex-chat-pin-collection-actions"><button type="button" data-collection-action="retry" aria-label="重试失败的采集项" hidden>重试</button><button type="button" data-collection-action="clear" aria-label="清空采集队列">清空</button><button type="button" data-collection-action="exit" aria-label="退出采集模式">退出</button></span>';
+      card.querySelector('[data-collection-action="retry"]').addEventListener("click", async () => {
+        try {
+          const message = await requestCollection("retry");
+          applyCollectionState(message.state);
+          const count = Number(message.state?.retriedCount || 0);
+          toast(count ? `已重新排队 ${count} 项失败任务` : "没有需要重试的失败任务");
+        } catch (error) {
+          toast(`重试采集失败：${error.message}`, "error");
+        }
+      });
+      card.querySelector('[data-collection-action="clear"]').addEventListener("click", async () => {
+        try {
+          const message = await requestCollection("clear");
+          applyCollectionState(message.state);
+          const count = Number(message.state?.clearedCount || 0);
+          toast(count ? `已清空 ${count} 项采集记录` : "采集队列已经为空");
+        } catch (error) {
+          toast(`清空采集队列失败：${error.message}`, "error");
+        }
+      });
+      card.querySelector('[data-collection-action="exit"]').addEventListener("click", async () => {
+        try {
+          const message = await requestCollection("disable");
+          applyCollectionState(message.state);
+          toast("已关闭采集模式；已入队任务会继续完成");
+        } catch (error) {
+          toast(`关闭采集模式失败：${error.message}`, "error");
+        }
+      });
+      const editor = composerEditor(rootNode);
+      let anchor = editor;
+      while (anchor?.parentElement && anchor.parentElement !== rootNode) anchor = anchor.parentElement;
+      if (anchor?.parentElement === rootNode) rootNode.insertBefore(card, anchor);
+      else rootNode.prepend(card);
+    }
+    const pending = Number(collectionState.pendingCount || 0);
+    const running = Number(collectionState.counts?.running || 0);
+    const queued = Number(collectionState.counts?.queued || 0);
+    const failed = Number(collectionState.counts?.failed || 0);
+    const completed = Number(collectionState.counts?.completed || 0);
+    const total = Object.values(collectionState.counts || {}).reduce((sum, count) => sum + Number(count || 0), 0);
+    const phaseLabels = {
+      preparing: "准备 CLI 与预处理",
+      "starting-turn": "启动独立任务",
+      executing: "独立 CLI 执行中",
+    };
+    const startedAt = Date.parse(collectionState.runningStartedAt || "");
+    const elapsedMs = Number.isFinite(startedAt) ? Math.max(0, Date.now() - startedAt) : 0;
+    const elapsed = elapsedMs >= 60_000
+      ? `${Math.floor(elapsedMs / 60_000)}m ${Math.floor((elapsedMs % 60_000) / 1000)}s`
+      : elapsedMs >= 1_000
+        ? `${Math.floor(elapsedMs / 1000)}s`
+        : "";
+    const activeStatus = running
+      ? `${phaseLabels[collectionState.runningPhase] || "执行中"}${elapsed ? ` ${elapsed}` : ""}${queued ? ` · 另有 ${queued} 项排队` : ""}`
+      : "";
+    const suffix = pending
+      ? ` · ${activeStatus || `${pending} 项待处理`}${completed ? ` · 已完成 ${completed} 项` : ""}`
+      : completed
+        ? ` · 已完成 ${completed} 项`
+        : " · 队列空闲";
+    const fileText = `${collectionState.fileName}${suffix}`;
+    const fileNode = card.querySelector(".codex-chat-pin-collection-file");
+    if (fileNode.textContent !== fileText) fileNode.textContent = fileText;
+    const statusErrors = [];
+    if (failed) statusErrors.push(`${failed} 项失败`);
+    const retryButton = card.querySelector('[data-collection-action="retry"]');
+    const hideRetry = failed === 0;
+    if (retryButton.hidden !== hideRetry) retryButton.hidden = hideRetry;
+    const errorText = statusErrors.length ? `· ${statusErrors.join(" · ")}` : "";
+    const errorNode = card.querySelector(".codex-chat-pin-collection-error");
+    if (errorNode.textContent !== errorText) errorNode.textContent = errorText;
+    const clearButton = card.querySelector('[data-collection-action="clear"]');
+    const disableClear = total === 0;
+    if (clearButton.disabled !== disableClear) clearButton.disabled = disableClear;
+    const cardTitle = collectionState.workspacePath
+      ? `执行工作区：${collectionState.workspacePath}`
+      : "后续输入将作为独立任务加入采集队列并落实到当前工作区";
+    if (card.title !== cardTitle) card.title = cardTitle;
+  }
+
+  function upsertCollectionResult(value) {
+    if (!value?.id || !value.output) return;
+    const next = {
+      id: String(value.id),
+      input: String(value.input || ""),
+      output: String(value.output || ""),
+      truncated: value.truncated === true,
+      changedFiles: Array.isArray(value.changedFiles) ? value.changedFiles : [],
+      completedAt: String(value.completedAt || ""),
+      executionProfile: value.executionProfile || null,
+      metrics: value.metrics || null,
+    };
+    collectionResults = [...collectionResults.filter((item) => item.id !== next.id), next].slice(-20);
+    collectionResultOpenState.delete(next.id);
+    collectionResultsHidden = false;
+    schedule();
+  }
+
+  function addCollectionResultCards() {
+    const rootNode = threadComposerRoot();
+    const parent = rootNode?.parentElement;
+    const existing = [...document.querySelectorAll(`[${COLLECTION_RESULTS_ATTRIBUTE}="true"]`)];
+    if (!parent || collectionResults.length === 0 || collectionResultsHidden) {
+      existing.forEach((node) => node.remove());
+      return;
+    }
+    let panel = existing.find((node) => node.parentElement === parent);
+    existing.filter((node) => node !== panel).forEach((node) => node.remove());
+    if (!panel) {
+      panel = document.createElement("section");
+      panel.setAttribute(COLLECTION_RESULTS_ATTRIBUTE, "true");
+      panel.innerHTML = '<div class="codex-chat-pin-results-header"><span></span><div class="codex-chat-pin-results-actions"><button type="button" data-results-action="collapse">收起</button><button type="button" data-results-action="clear">清空报告</button><button type="button" data-results-action="close">关闭</button></div></div><div class="codex-chat-pin-results-list"></div>';
+      panel.querySelector('[data-results-action="collapse"]').addEventListener("click", (event) => {
+        const list = panel.querySelector(".codex-chat-pin-results-list");
+        collectionResultsCollapsed = !collectionResultsCollapsed;
+        list.hidden = collectionResultsCollapsed;
+        event.currentTarget.textContent = collectionResultsCollapsed ? "展开" : "收起";
+      });
+      panel.querySelector('[data-results-action="clear"]').addEventListener("click", async (event) => {
+        const clearButton = event.currentTarget;
+        if (!collectionSupports("clear-reports")) {
+          toast("启动器版本过旧，请完全重启 ChatGPT_Pin.cmd 和专用 Codex", "error");
+          return;
+        }
+        if (!window.confirm("清空当前任务的采集执行报告？这不会撤销已修改的文件，也不会关闭采集模式。")) return;
+        clearButton.disabled = true;
+        try {
+          const message = await requestCollection("clear-reports");
+          collectionResultsHidden = false;
+          collectionResultsCollapsed = false;
+          collectionResultOpenState.clear();
+          applyCollectionState(message.state);
+          const count = Number(message.state?.clearedReportCount || 0);
+          toast(count ? `已清空 ${count} 项采集执行报告` : "没有可清空的采集执行报告");
+        } catch (error) {
+          toast(`清空采集执行报告失败：${error.message}`, "error");
+        } finally {
+          if (clearButton.isConnected) clearButton.disabled = false;
+        }
+      });
+      panel.querySelector('[data-results-action="close"]').addEventListener("click", () => {
+        collectionResultsHidden = true;
+        schedule();
+      });
+      parent.insertBefore(panel, rootNode);
+    }
+    const headerText = `采集执行报告（本地） · ${collectionResults.length} 项`;
+    const header = panel.querySelector(".codex-chat-pin-results-header span");
+    if (header.textContent !== headerText) header.textContent = headerText;
+    const clearButton = panel.querySelector('[data-results-action="clear"]');
+    const hideClear = !collectionSupports("clear-reports");
+    if (clearButton.hidden !== hideClear) clearButton.hidden = hideClear;
+    const collapseButton = panel.querySelector('[data-results-action="collapse"]');
+    const collapseText = collectionResultsCollapsed ? "展开" : "收起";
+    if (collapseButton.textContent !== collapseText) collapseButton.textContent = collapseText;
+    const list = panel.querySelector(".codex-chat-pin-results-list");
+    list.hidden = collectionResultsCollapsed;
+    const shown = collectionResults.slice(-8);
+    const renderKey = hash(JSON.stringify(shown));
+    if (list.dataset.renderKey === renderKey) return;
+    const fragment = document.createDocumentFragment();
+    shown.forEach((result, index) => {
+      const details = document.createElement("details");
+      const resultId = String(result.id);
+      details.dataset.collectionResultId = resultId;
+      details.open = collectionResultOpenState.has(resultId)
+        ? collectionResultOpenState.get(resultId) === true
+        : index === shown.length - 1;
+      details.addEventListener("toggle", () => {
+        collectionResultOpenState.set(resultId, details.open);
+      });
+      const summary = document.createElement("summary");
+      const input = result.input.replace(/\s+/g, " ").trim();
+      summary.textContent = `${result.completedAt || "已完成"} · ${input.slice(0, 90) || "采集项"}`;
+      const output = document.createElement("pre");
+      output.textContent = `${result.output}${result.truncated ? "\n\n……执行报告较长，界面仅显示前 6000 个字符。" : ""}`;
+      const changedFiles = document.createElement("div");
+      changedFiles.className = "codex-chat-pin-results-files";
+      const paths = (result.changedFiles || []).map((change) => change.path).filter(Boolean);
+      changedFiles.textContent = paths.length ? `App Server 文件变更：${paths.join("、")}` : "App Server 未返回结构化 fileChange；请以执行报告和磁盘文件为准。";
+      const performance = document.createElement("div");
+      performance.className = "codex-chat-pin-results-files";
+      const formatDuration = (milliseconds) => {
+        const value = Number(milliseconds);
+        if (!Number.isFinite(value) || value < 0) return "";
+        if (value < 1000) return `${Math.round(value)}ms`;
+        if (value < 60_000) return `${(value / 1000).toFixed(value < 10_000 ? 1 : 0)}s`;
+        return `${Math.floor(value / 60_000)}m ${Math.round((value % 60_000) / 1000)}s`;
+      };
+      const metrics = result.metrics || {};
+      const profile = result.executionProfile || {};
+      const parts = [
+        metrics.totalMs != null ? `总耗时 ${formatDuration(metrics.totalMs)}` : "",
+        metrics.preflightMs != null ? `预处理 ${formatDuration(metrics.preflightMs)}` : "",
+        metrics.firstToolMs != null ? `首次工具 ${formatDuration(metrics.firstToolMs)}` : "",
+        metrics.firstWriteMs != null ? `首次写入 ${formatDuration(metrics.firstWriteMs)}` : "",
+        Number(metrics.compactionCount || 0) ? `压缩 ${metrics.compactionCount} 次` : "",
+        profile.model ? `${profile.effectiveModel || profile.model} / ${profile.effectiveEffort || profile.effort || "default"}${profile.fallback ? " (fallback)" : ""}` : "",
+      ].filter(Boolean);
+      performance.textContent = parts.length ? `性能：${parts.join(" · ")}` : "";
+      performance.hidden = parts.length === 0;
+      const copy = document.createElement("button");
+      copy.type = "button";
+      copy.textContent = "复制报告";
+      copy.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(result.output);
+          toast("已复制采集执行报告");
+        } catch (error) {
+          toast(`复制采集执行报告失败：${error.message}`, "error");
+        }
+      });
+      details.append(summary, changedFiles, performance, output, copy);
+      fragment.appendChild(details);
+    });
+    list.replaceChildren(fragment);
+    list.dataset.renderKey = renderKey;
+  }
+
   function sendButton(rootNode) {
     const candidates = [...(rootNode?.querySelectorAll("button") || [])].filter((button) => {
       if (!visible(button) || button.disabled) return false;
@@ -675,6 +1166,123 @@
       return labels.some((label) => /发送|send|submit/.test(label));
     });
     return labelled || candidates.findLast((button) => button.getAttribute("type") === "submit") || null;
+  }
+
+  function desktopExecutionLabel(rootNode) {
+    const buttons = [...(rootNode?.querySelectorAll("button") || [])].filter((button) => {
+      if (!visible(button) || button.hasAttribute(COLLECTION_SEND_OVERLAY_ATTRIBUTE)) return false;
+      if (button.hasAttribute(BUTTON_ATTRIBUTE)
+        || button.hasAttribute(OPEN_ATTRIBUTE)
+        || button.hasAttribute(REVISION_ATTRIBUTE)
+        || button.hasAttribute(COLLECTION_ATTRIBUTE)) return false;
+      return true;
+    });
+    for (const button of buttons) {
+      const label = String(`${button.innerText || button.textContent || ""} ${button.getAttribute("aria-label") || ""} ${button.title || ""}`)
+        .replace(/\s+/g, " ")
+        .trim();
+      if (/(?:gpt[- ]*)?5\.\d+\s*(?:sol|terra|luna)\b/i.test(label)
+        || /(?:gpt[- ]*)?5\.[45]\b/i.test(label)) return label;
+    }
+    return "";
+  }
+
+  function submitRoot(event) {
+    const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+    if (target?.closest?.(`[${COLLECTION_SEND_OVERLAY_ATTRIBUTE}="true"]`)) return threadComposerRoot();
+    return target?.closest?.('[data-codex-composer-root][data-composer-placement="thread"]') || null;
+  }
+
+  function isNativeSendButton(button, rootNode) {
+    if (button?.hasAttribute(COLLECTION_SEND_OVERLAY_ATTRIBUTE)) return Boolean(rootNode);
+    if (!button || !rootNode?.contains(button)) return false;
+    if (button.hasAttribute(BUTTON_ATTRIBUTE)
+      || button.hasAttribute(OPEN_ATTRIBUTE)
+      || button.hasAttribute(REVISION_ATTRIBUTE)
+      || button.hasAttribute(COLLECTION_ATTRIBUTE)
+      || button.closest(`[${REVISION_CARD_ATTRIBUTE}="true"],[${COLLECTION_CARD_ATTRIBUTE}="true"]`)) return false;
+    if (button === sendButton(rootNode) || button.getAttribute("type") === "submit") return true;
+    const label = norm(`${button.textContent} ${button.getAttribute("aria-label")} ${button.title}`);
+    return /(^|\s)(发送|send|submit)(\s|$)/.test(label) && !/(停止|stop|取消|cancel)/.test(label);
+  }
+
+  function restoreNativeCollectionSend(button) {
+    if (!(button instanceof HTMLButtonElement)) return;
+    const previous = guardedNativeSendState.get(button);
+    if (previous) {
+      button.disabled = previous.disabled;
+      if (previous.ariaDisabled === null) button.removeAttribute("aria-disabled");
+      else button.setAttribute("aria-disabled", previous.ariaDisabled);
+      guardedNativeSendState.delete(button);
+    }
+    button.removeAttribute(COLLECTION_SEND_GUARD_ATTRIBUTE);
+  }
+
+  function guardNativeCollectionSend() {
+    const enabled = collectionState.enabled && collectionState.sessionId === identity.id;
+    const rootNode = enabled ? threadComposerRoot() : null;
+    const overlays = [...document.querySelectorAll(`[${COLLECTION_SEND_OVERLAY_ATTRIBUTE}="true"]`)];
+    document.querySelectorAll(`[${COLLECTION_SEND_GUARD_ATTRIBUTE}="true"]`).forEach((button) => {
+      if (!rootNode?.contains(button)) restoreNativeCollectionSend(button);
+    });
+    if (!rootNode) {
+      overlays.forEach((overlay) => overlay.remove());
+      return;
+    }
+    const guarded = [...rootNode.querySelectorAll(`[${COLLECTION_SEND_GUARD_ATTRIBUTE}="true"]`)]
+      .find((candidate) => visible(candidate));
+    const button = guarded || sendButton(rootNode);
+    if (!button) {
+      overlays.forEach((overlay) => overlay.remove());
+      return;
+    }
+    if (!guardedNativeSendState.has(button)) {
+      guardedNativeSendState.set(button, {
+        disabled: button.disabled,
+        ariaDisabled: button.getAttribute("aria-disabled"),
+      });
+    }
+    button.setAttribute(COLLECTION_SEND_GUARD_ATTRIBUTE, "true");
+    button.disabled = true;
+    button.setAttribute("aria-disabled", "true");
+    let overlay = overlays[0];
+    overlays.slice(1).forEach((candidate) => candidate.remove());
+    if (!overlay) {
+      overlay = document.createElement("button");
+      overlay.type = "button";
+      overlay.setAttribute(COLLECTION_SEND_OVERLAY_ATTRIBUTE, "true");
+      overlay.setAttribute("aria-label", "发送到采集队列");
+      overlay.title = "发送到采集队列";
+      document.body.appendChild(overlay);
+    }
+    const rect = button.getBoundingClientRect();
+    Object.assign(overlay.style, {
+      left: `${rect.left}px`,
+      top: `${rect.top}px`,
+      width: `${rect.width}px`,
+      height: `${rect.height}px`,
+      display: rect.width > 0 && rect.height > 0 ? "block" : "none",
+    });
+  }
+
+  function handleCollectionViewportChange() {
+    if (collectionState.enabled) guardNativeCollectionSend();
+  }
+
+  function handleCollectionComposerInput() {
+    if (!collectionState.enabled) return;
+    guardNativeCollectionSend();
+    schedule();
+  }
+
+  function guardedSendButtonAtPoint(rootNode, event) {
+    const x = Number(event?.clientX);
+    const y = Number(event?.clientY);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    return [...rootNode.querySelectorAll(`[${COLLECTION_SEND_GUARD_ATTRIBUTE}="true"]`)].find((button) => {
+      const rect = button.getBoundingClientRect();
+      return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+    }) || null;
   }
 
   function cleanupLegacyRevisionComposer() {
@@ -774,19 +1382,103 @@
     }
   }
 
+  async function prepareCollectionSubmit(event, rootNode) {
+    if (!collectionState.enabled || collectionState.sessionId !== identity.id) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    if (!collectionSupports("workspace-write")) {
+      toast("无法执行采集：启动器仍是旧版，请完全关闭 ChatGPT_Pin.cmd 和专用 Codex 后重新启动", "error");
+      return;
+    }
+    if (collectionSubmitting) return;
+    const editor = composerEditor(rootNode);
+    const input = composerValue(editor).trim();
+    if (!editor || !input) {
+      toast("请输入本次采集要求", "error");
+      return;
+    }
+    collectionSubmitting = true;
+    const detached = replaceComposerValueImmediately(editor, "");
+    if (!detached) {
+      collectionSubmitting = false;
+      toast("无法接管 Codex 输入框，本次内容未加入采集队列", "error");
+      return;
+    }
+    try {
+      const currentExecutionLabel = collectionSupports("desktop-execution-selection")
+        ? desktopExecutionLabel(rootNode)
+        : "";
+      const message = await requestCollection("enqueue", {
+        input,
+        composerCleared: true,
+        ...(currentExecutionLabel ? { desktopExecutionLabel: currentExecutionLabel } : {}),
+      }, 20_000);
+      applyCollectionState(message.state);
+      const pending = Number(message.state?.pendingCount || 0);
+      if (message.state?.composer?.cleared === false) {
+        toast(`已加入采集队列，但输入框未清空：${message.state.composer.error || "请手动清空"}`, "error");
+      } else {
+        toast(`已加入采集队列${pending ? `（${pending} 项待处理）` : ""}`);
+      }
+    } catch (error) {
+      setTimeout(() => {
+        if (editor.isConnected && !composerValue(editor).trim()) {
+          replaceComposerValueImmediately(editor, input);
+        }
+      }, 900);
+      toast(`无法加入采集队列：${error.message}`, "error");
+    } finally {
+      setTimeout(() => { collectionSubmitting = false; }, 750);
+    }
+  }
+
   function handleSubmitClick(event) {
-    const rootNode = event.target?.closest?.('[data-codex-composer-root][data-composer-placement="thread"]');
-    if (!rootNode || !revisionState.enabled) return;
-    const button = event.target.closest("button");
-    if (!button || button !== sendButton(rootNode)) return;
-    void prepareRevisionSubmit(event, rootNode);
+    const rootNode = submitRoot(event);
+    if (!rootNode || (!revisionState.enabled && !collectionState.enabled)) return;
+    const button = event.target?.closest?.("button") || guardedSendButtonAtPoint(rootNode, event);
+    if (!isNativeSendButton(button, rootNode)) return;
+    if (collectionState.enabled) void prepareCollectionSubmit(event, rootNode);
+    else void prepareRevisionSubmit(event, rootNode);
+  }
+
+  function handleCollectionPointerSubmit(event) {
+    if (!collectionState.enabled || collectionState.sessionId !== identity.id) return;
+    if (Number.isFinite(event.button) && event.button !== 0) return;
+    const rootNode = submitRoot(event);
+    const button = event.target?.closest?.("button") || guardedSendButtonAtPoint(rootNode, event);
+    if (!rootNode || !isNativeSendButton(button, rootNode)) return;
+    void prepareCollectionSubmit(event, rootNode);
+  }
+
+  function handleNativeFormSubmit(event) {
+    if (!collectionState.enabled || collectionState.sessionId !== identity.id) return;
+    const rootNode = submitRoot(event)
+      || (event.target instanceof HTMLFormElement && event.target.contains(threadComposerRoot()) ? threadComposerRoot() : null);
+    if (!rootNode) return;
+    void prepareCollectionSubmit(event, rootNode);
   }
 
   function handleSubmitKeydown(event) {
     if (event.key !== "Enter" || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey || event.isComposing) return;
     const rootNode = event.target?.closest?.('[data-codex-composer-root][data-composer-placement="thread"]');
-    if (!rootNode || !revisionState.enabled || !composerEditor(rootNode)?.contains(event.target)) return;
-    void prepareRevisionSubmit(event, rootNode);
+    if (!rootNode || (!revisionState.enabled && !collectionState.enabled) || !composerEditor(rootNode)?.contains(event.target)) return;
+    if (collectionState.enabled) void prepareCollectionSubmit(event, rootNode);
+    else void prepareRevisionSubmit(event, rootNode);
+  }
+
+  function handleCollectionKeyup(event) {
+    if (event.key !== "Enter" || !collectionState.enabled || event.isComposing) return;
+    const rootNode = event.target?.closest?.('[data-codex-composer-root][data-composer-placement="thread"]');
+    if (!rootNode || !composerEditor(rootNode)?.contains(event.target)) return;
+    void prepareCollectionSubmit(event, rootNode);
+  }
+
+  function handleCollectionBeforeInput(event) {
+    if (!collectionState.enabled || !["insertParagraph", "insertLineBreak"].includes(event.inputType)) return;
+    const rootNode = event.target?.closest?.('[data-codex-composer-root][data-composer-placement="thread"]');
+    if (!rootNode || !composerEditor(rootNode)?.contains(event.target)) return;
+    void prepareCollectionSubmit(event, rootNode);
   }
 
   function refresh() {
@@ -801,8 +1493,11 @@
       pair.message.classList.toggle(HIGHLIGHT_CLASS, Boolean(lastPinnedFingerprint && value?.fingerprint === lastPinnedFingerprint));
     }
     addOpenPinEntries();
-    addRevisionButtons();
+    addModeButtons();
     addRevisionCard();
+    addCollectionCard();
+    addCollectionResultCards();
+    guardNativeCollectionSend();
     cleanupLegacyRevisionComposer();
     maybeFinishRevisionTurn(activePairs);
   }
@@ -812,6 +1507,26 @@
     try {
       message = typeof payload === "string" ? JSON.parse(payload) : payload;
     } catch {
+      return;
+    }
+    if (message?.type === "collection-event") {
+      if (message.sessionId !== identity.id) return;
+      applyCollectionState(message.state);
+      if (message.event === "item-completed") {
+        upsertCollectionResult(message.item);
+        toast("采集执行完成；报告已显示在当前任务输入框上方");
+      } else if (message.event === "item-failed") {
+        toast(`采集失败：${message.item?.error || "未知错误"}`, "error");
+      }
+      return;
+    }
+    if (message?.type === "collection-result") {
+      const pending = pendingCollectionRequests.get(message.requestId);
+      if (!pending) return;
+      clearTimeout(pending.timeout);
+      pendingCollectionRequests.delete(message.requestId);
+      if (!message.ok) pending.reject(new Error(message.error || "采集请求失败"));
+      else pending.resolve(message);
       return;
     }
     if (message?.type === "revision-result") {
@@ -851,6 +1566,7 @@
       revisionState = { enabled: false };
       revisionTurn = null;
     }
+    if (message.collectionDisabled) collectionState = { enabled: false };
     if (!message.openResult?.ok) {
       toast(`已保存 ${message.fileName}，但原生文件页打开失败：${message.openResult?.error || "未找到文件入口"}`, "error");
       return;
@@ -868,29 +1584,55 @@
       updateIdentity();
       refresh();
       void syncRevisionStatus();
+      void syncCollectionStatus();
     }, 180);
   }
 
   function mount() {
     style();
     refresh();
-    document.addEventListener("click", handleSubmitClick, true);
-    document.addEventListener("keydown", handleSubmitKeydown, true);
-    observer = new MutationObserver(schedule);
+    window.addEventListener("pointerdown", handleCollectionPointerSubmit, true);
+    window.addEventListener("mousedown", handleCollectionPointerSubmit, true);
+    window.addEventListener("pointerup", handleCollectionPointerSubmit, true);
+    window.addEventListener("click", handleSubmitClick, true);
+    window.addEventListener("keydown", handleSubmitKeydown, true);
+    window.addEventListener("keyup", handleCollectionKeyup, true);
+    window.addEventListener("beforeinput", handleCollectionBeforeInput, true);
+    window.addEventListener("submit", handleNativeFormSubmit, true);
+    window.addEventListener("input", handleCollectionComposerInput, true);
+    window.addEventListener("resize", handleCollectionViewportChange, true);
+    window.addEventListener("scroll", handleCollectionViewportChange, true);
+    observer = new MutationObserver(() => {
+      if (collectionState.enabled) guardNativeCollectionSend();
+      schedule();
+    });
     observer.observe(document.documentElement, { childList: true, subtree: true });
     void syncRevisionStatus();
+    void syncCollectionStatus();
   }
 
   function destroy() {
     observer?.disconnect();
     clearTimeout(timer);
+    clearTimeout(collectionStatusPollTimer);
     clearTimeout(revisionTurn?.timeout);
-    document.removeEventListener("click", handleSubmitClick, true);
-    document.removeEventListener("keydown", handleSubmitKeydown, true);
+    window.removeEventListener("pointerdown", handleCollectionPointerSubmit, true);
+    window.removeEventListener("mousedown", handleCollectionPointerSubmit, true);
+    window.removeEventListener("pointerup", handleCollectionPointerSubmit, true);
+    window.removeEventListener("click", handleSubmitClick, true);
+    window.removeEventListener("keydown", handleSubmitKeydown, true);
+    window.removeEventListener("keyup", handleCollectionKeyup, true);
+    window.removeEventListener("beforeinput", handleCollectionBeforeInput, true);
+    window.removeEventListener("submit", handleNativeFormSubmit, true);
+    window.removeEventListener("input", handleCollectionComposerInput, true);
+    window.removeEventListener("resize", handleCollectionViewportChange, true);
+    window.removeEventListener("scroll", handleCollectionViewportChange, true);
     document.getElementById(STYLE_ID)?.remove();
     document.querySelectorAll(`[${BUTTON_ATTRIBUTE}="true"]`).forEach((node) => node.remove());
     document.querySelectorAll(`[${OPEN_ATTRIBUTE}="true"]`).forEach((node) => node.remove());
-    document.querySelectorAll(`[${REVISION_ATTRIBUTE}="true"],[${REVISION_CARD_ATTRIBUTE}="true"]`).forEach((node) => node.remove());
+    document.querySelectorAll(`[${REVISION_ATTRIBUTE}="true"],[${REVISION_CARD_ATTRIBUTE}="true"],[${COLLECTION_ATTRIBUTE}="true"],[${COLLECTION_CARD_ATTRIBUTE}="true"],[${COLLECTION_RESULTS_ATTRIBUTE}="true"]`).forEach((node) => node.remove());
+    document.querySelectorAll(`[${COLLECTION_SEND_GUARD_ATTRIBUTE}="true"]`).forEach(restoreNativeCollectionSend);
+    document.querySelectorAll(`[${COLLECTION_SEND_OVERLAY_ATTRIBUTE}="true"]`).forEach((node) => node.remove());
     document.querySelectorAll(`.${HIGHLIGHT_CLASS}`).forEach((node) => node.classList.remove(HIGHLIGHT_CLASS));
     document.querySelector(".codex-chat-pin-toast")?.remove();
     pendingSaves.clear();
@@ -900,6 +1642,11 @@
       pending.reject(new Error("Chat Pin 注入已重新加载"));
     }
     pendingRevisionRequests.clear();
+    for (const pending of pendingCollectionRequests.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error("Chat Pin 注入已重新加载"));
+    }
+    pendingCollectionRequests.clear();
   }
 
   window[API_KEY] = {
@@ -918,7 +1665,11 @@
       pinButtons: document.querySelectorAll(`[${BUTTON_ATTRIBUTE}="true"]`).length,
       openPinEntries: document.querySelectorAll(`[${OPEN_ATTRIBUTE}="true"]`).length,
       revisionButtons: document.querySelectorAll(`[${REVISION_ATTRIBUTE}="true"]`).length,
+      collectionButtons: document.querySelectorAll(`[${COLLECTION_ATTRIBUTE}="true"]`).length,
+      collectionResultCards: collectionResults.length,
+      collectionSendOverlays: document.querySelectorAll(`[${COLLECTION_SEND_OVERLAY_ATTRIBUTE}="true"]`).length,
       revisionState,
+      collectionState,
       revisionTurn: revisionTurn ? { turnId: revisionTurn.turnId, startedAt: revisionTurn.startedAt } : null,
       customPanel: false,
       pendingSaves: pendingSaves.size,

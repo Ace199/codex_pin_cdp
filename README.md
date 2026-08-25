@@ -1,24 +1,47 @@
 # Chat Pin for Codex Desktop
 
-这是一个针对 Windows 和 macOS Codex Desktop 的本地 UI 注入器。它不修改 Codex 安装包，也不读取或复制 Cookie、登录数据或聊天数据库。
+Chat Pin is a local UI injector for Codex Desktop on Windows and macOS. It does not modify the Codex installation package or read or copy cookies, login data, or chat databases.
 
-## 启动
+For the design and implementation boundaries of Collection mode, see [`docs/COLLECTION_MODE_DESIGN.md`](docs/COLLECTION_MODE_DESIGN.md).
+
+## Getting Started
 
 ```powershell
 npm start
 ```
 
-Windows 也可以直接双击项目根目录的 `ChatGPT_Pin.cmd`，或使用安装到桌面/开始菜单的“Codex Chat Pin”快捷方式。启动脚本使用纯 ASCII 文件名和内容，以兼容不同 Windows 命令行代码页。快捷方式使用复制到项目 `assets/codex.ico` 的 Codex 官方应用图标。快捷方式仍会显示启动终端；保持终端运行，关闭它即可停止专用 Pin 实例。
+On Windows, you can also double-click `ChatGPT_Pin.cmd` in the project root or use the “Codex Chat Pin” shortcut installed on the desktop or Start menu. The startup script uses an ASCII-only filename and content to remain compatible with different Windows command-line code pages, and switches the console to UTF-8 before Node.js starts. The shortcut uses the official Codex app icon copied to `assets/codex.ico`. The shortcut still opens a terminal window; keep it running, and close it to stop the dedicated Pin instance. Collection progress is printed in this same terminal; the App Server protocol itself is not exposed as an interactive prompt.
 
-启动器会打开一个使用项目内独立配置目录的 Codex 窗口，并通过私有 CDP 管道注入界面。首次使用该独立窗口时，可能需要在窗口中自行登录。保持启动器窗口运行；关闭启动器会停止其管理的 Codex 窗口。
+The launcher opens a Codex window with an isolated profile stored inside the project and injects the UI through a private CDP pipe. The first time you use this isolated window, you may need to sign in manually. Keep the launcher window running; closing it stops the Codex window managed by the launcher.
 
-启动器参照 Codex Taskboard 的桌面端启动方式定位官方应用：Windows 查找 Microsoft Store 包内的 `app\\ChatGPT.exe`，macOS 依次查找 `/Applications` 和 `~/Applications` 下的 `ChatGPT.app`、`Codex.app`，然后直接向桌面端传递独立 profile 与私有 CDP pipe 参数。`resources\\codex.exe`（macOS 中为 `Contents/Resources/codex`）是 CLI，不用于启动桌面界面。
+The launcher locates the official app using the same desktop launch approach as Codex Taskboard. On Windows, it looks for `app\\ChatGPT.exe` inside the Microsoft Store package. On macOS, it searches `/Applications` and `~/Applications` for `ChatGPT.app` and `Codex.app`. It then passes the isolated profile and private CDP pipe arguments directly to the desktop app. `resources\\codex.exe` (or `Contents/Resources/codex` on macOS) is the CLI and is not used to launch the desktop UI.
 
-部分 Windows 安装会拒绝 Node 直接创建 WindowsApps 内的桌面进程并返回 `spawn EPERM`。遇到该错误时，启动器会自动通过注册的 Codex AUMID 激活应用，传入相同的独立 profile，并使用随机的 `127.0.0.1` CDP WebSocket 端口继续注入。可用 `--windows-activation` 主动测试该路径。此端口没有额外身份验证，因此启动器运行期间只能运行受信任的本机程序。
+Some Windows installations prevent Node.js from creating the desktop process inside WindowsApps and return `spawn EPERM`. When this happens, the launcher automatically activates the app through its registered Codex AUMID, passes the same isolated profile, and continues injection over a random `127.0.0.1` CDP WebSocket port. Use `--windows-activation` to test this path explicitly. This port has no additional authentication, so only trusted local programs should run while the launcher is active.
 
-默认独立 profile 位于项目的 `.codex-pin-profile`；测试或多实例场景可通过 `CODEX_PIN_PROFILE` 指定其他目录。
+By default, the isolated profile is stored in `.codex-pin-profile` in the project. For testing or multiple instances, use `CODEX_PIN_PROFILE` to specify another directory.
 
-应用安装在非默认位置时可显式指定。macOS 可传 `.app` 路径或内部可执行文件；Windows 传桌面端 `ChatGPT.exe`：
+Collection mode requires a separately installed, executable Codex CLI. Enabling the mode resolves the independent CLI path and persists the mode immediately; the launcher checks both `codex --version` and `codex app-server --help` when the first queued item starts. This prevents a cold App Server startup from blocking the UI. It does not treat the bundled CLI inside the Microsoft Store desktop package as usable when that executable returns `EPERM`. If the CLI is not in a standard location, set:
+
+```powershell
+$env:CODEX_PIN_CLI_PATH = "C:\path\to\codex.cmd"
+npm start
+```
+
+On macOS, `CODEX_PIN_CLI_PATH` can likewise point to the `codex` executable. Chat Pin does not install or upgrade the CLI automatically or modify the system `PATH`.
+
+Each Collection item snapshots the model and reasoning effort currently selected beside the Codex Desktop composer (for example, `5.6 Sol` and `high`) and passes that selection to the independent CLI. If the UI label cannot be recognized, Collection execution falls back to its automatic profile: `gpt-5.6-terra` with `medium` reasoning for routine archive work, or `gpt-5.6-sol` with `high` reasoning when deterministic checks identify security research, repository migration, redirects, or same-name conflicts. Explicit environment variables take precedence over the Desktop selection:
+
+```powershell
+$env:CODEX_PIN_COLLECTION_PROFILE = "routine" # routine, complex, or inherit
+$env:CODEX_PIN_COLLECTION_MODEL = "gpt-5.6-terra"
+$env:CODEX_PIN_COLLECTION_EFFORT = "medium"
+$env:CODEX_PIN_COLLECTION_COMPACT_TOKENS = "100000" # 0 disables the launcher override
+$env:CODEX_PIN_COLLECTION_COMPACT_SCOPE = "body_after_prefix" # or total
+```
+
+The default compaction threshold counts context growth after the stable carried prefix. Codex App Server performs compaction only after that growth crosses 100,000 tokens; Chat Pin does not add a separate summarization request before every collection item.
+
+If the app is installed in a non-default location, specify it explicitly. On macOS, you can pass either the `.app` path or the internal executable; on Windows, pass the desktop `ChatGPT.exe`:
 
 ```powershell
 node scripts/pin-launcher.mjs --launch --watch --app-path "C:\\path\\to\\ChatGPT.exe"
@@ -28,31 +51,48 @@ node scripts/pin-launcher.mjs --launch --watch --app-path "C:\\path\\to\\ChatGPT
 node scripts/pin-launcher.mjs --launch --watch --app-path "/custom/Codex.app"
 ```
 
-也可以使用环境变量 `CODEX_PIN_APP_PATH`。`explorer.exe shell:AppsFolder\\<AUMID>` 适合普通启动，但不能建立本项目所需、绑定到当前 Node 进程的私有 CDP pipe，因此不作为注入启动路径。
+You can also use the `CODEX_PIN_APP_PATH` environment variable. `explorer.exe shell:AppsFolder\\<AUMID>` works for a normal launch, but it cannot create the private CDP pipe required by this project and bind it to the current Node.js process, so it is not used as an injection launch path.
 
-## 当前功能
+## Current Features
 
-- 仅在最终助手回复的操作区追加 Pin 图标；不会在用户消息或代码块的复制按钮旁添加。
-- 点击 Pin 后先把整条助手回复转换并保存为 Markdown，再用 Codex 原生“打开文件”侧栏页打开。
-- 在侧栏未打开时的入口菜单和侧栏标签页“+”菜单底部，都会追加“打开 Pin 文件”；点击后直接打开当前任务对应的 Markdown。
-- 当 Codex 没有为右上角侧栏图标暴露稳定的可访问名称时，启动器会使用原生侧栏快捷键展开右侧区域，再继续打开文件。
-- 原生文件 Tab 会固定在侧栏顶部；再次 Pin 同一会话时优先复用同名 Tab，避免新增重复页签。
-- 精确文件名筛选会优先点击原生第一结果；仅在快速路径失败时进入慢索引兼容流程，成功提示会显示本次原生打开耗时。
-- Pin 按会话隔离，主副本写入本项目的 `pins/pin_<会话ID>.md`。无法取得可靠会话 ID 时使用稳定路由摘要；取消置顶不会删除对应文件。
-- 当 Codex 当前任务使用另一个本地工作区时，启动器会在该工作区的 `pins/` 目录生成同名 Pin 镜像，并让原生文件筛选器打开镜像；因此不再要求当前任务工作区必须是 Chat Pin 项目本身。
-- 主副本和工作区镜像分别写入其 Git 仓库本机的 `.git/info/exclude`，避免 Pin 内容进入 Git；不会修改目标项目的 `.gitignore`。原生打开时会短暂移除对应本地排除规则，结束后立即恢复。非 Git 工作区没有本地排除文件，镜像会作为普通文件保留在工作区的 `pins/` 目录。旧版 `temp/pin_*.md` 会自动迁移。
-- 标题、段落、粗体、斜体、删除线、引用、列表、代码块、链接、图片和表格会转换为 Markdown；代码块会剔除 Codex 的“纯文本/复制代码”等工具栏文字，并尽量保留 Python、JavaScript 等语言标记。复杂的自定义渲染仍可能降级为文本。
-- 打开当前任务的 Pin Markdown 后，会在“查看源代码”左侧显示“修订”按钮。开启后，输入框上方持续显示修订目标；输入框只显示用户自己的修改要求，文件修改约束会在点击发送时由启动器附加，让 Codex 直接编辑当前工作区中的 Pin 文件，而不是从回复正文重新提取并覆盖 Markdown。
-- 每轮修订发送前都会在独立 profile 的 `revision-history/` 中保存本地快照；最终助手回复完成后会比较文件哈希。文件确实变化时，工作区镜像会同步回本项目的 Pin 主副本；没有变化时会明确提示，不会把普通回答误报为成功修订。
-- 修订模式只绑定当前任务和当前 Pin 文件；切换任务后会安全关闭。修订期间再次 Pin 新回复会要求确认，以免意外覆盖正在修改的文档。
-- 写盘或原生打开失败会显示短暂错误提示，不会遮挡或替换 Codex 的聊天界面。
-- 本版本不注入独立 Pin 页面；菜单中的“打开 Pin 文件”只是打开原生 Markdown 文件，不会创建自定义页面。
+- Adds a Pin icon only to the action area of final assistant responses. It is not added to user messages or next to copy buttons in code blocks.
+- Clicking Pin converts the entire assistant response to Markdown, saves it, and then opens it in Codex’s native **Open File** sidebar page.
+- Adds **Open Pin File** to the bottom of both the sidebar entry menu when the sidebar is closed and the sidebar tab **+** menu. Selecting it opens the Markdown file for the current task directly.
+- When Codex does not expose a stable accessible name for the top-right sidebar icon, the launcher uses the native sidebar keyboard shortcut to expand the right pane before continuing to open the file.
+- Keeps the native file tab pinned at the top of the sidebar. Pinning the same conversation again reuses the tab with the same name whenever possible, avoiding duplicate tabs.
+- Exact filename filtering selects the first native result first. The slower indexing compatibility flow runs only if the fast path fails. A success notification reports the time taken by the native open operation.
+- Isolates Pins by conversation. The primary copy is stored as `pins/pin_<conversation-ID>.md` in this project. If a reliable conversation ID is unavailable, a stable route digest is used. Unpinning does not delete the corresponding file.
+- When the current Codex task uses another local workspace, the launcher creates a same-named Pin mirror in that workspace’s `pins/` directory and opens the mirror through the native file filter. The current task workspace therefore does not have to be the Chat Pin project itself.
+- Adds the primary copy and workspace mirror to each Git repository’s local `.git/info/exclude`, preventing Pin content from entering Git without modifying the target project’s `.gitignore`. The corresponding local exclusion rule is removed briefly while the file is opened natively and restored immediately afterward. A non-Git workspace has no local exclusion file, so the mirror remains as a normal file in its `pins/` directory. Legacy `temp/pin_*.md` files are migrated automatically.
+- Converts headings, paragraphs, bold, italics, strikethrough, blockquotes, lists, code blocks, links, images, and tables to Markdown. Code blocks omit Codex toolbar labels such as “Plain text” and “Copy code” and preserve language identifiers such as Python and JavaScript where possible. Complex custom rendering may still fall back to plain text.
+- Adds a **Revise** button to the left of **View Source** after opening the current task’s Pin Markdown file. When enabled, a persistent revision target appears above the input box. The input box contains only the user’s requested changes; when the user sends the request, the launcher appends the file-editing constraints so Codex edits the Pin file in the current workspace directly instead of extracting and overwriting Markdown from a response body.
+- Before each revision request is sent, saves a local snapshot under `revision-history/` in the isolated profile. After the final assistant response completes, it compares file hashes. If the file changed, the workspace mirror is synchronized back to the primary Pin copy in this project. If it did not change, Chat Pin reports that clearly instead of treating an ordinary answer as a successful revision.
+- Binds Revision mode only to the current task and current Pin file. Switching tasks disables it safely. Pinning a new response while a revision is active requires confirmation to avoid accidentally replacing the document being edited.
+- Shows a temporary error notification if writing or native file opening fails, without obscuring or replacing the Codex chat UI.
+- Does not inject a standalone Pin page. **Open Pin File** opens the native Markdown file page and does not create a custom page.
+- Adds **Collect** to the left of **View Source** on every native Markdown file page. Pin file pages retain the order **Collect**, **Revise**, **View Source**. The file page where **Collect** is selected becomes the active collection rule directly; Pin files and ordinary open files behave the same, and switching the source does not require a second confirmation. While enabled, the file-page button prominently displays **Collecting**, and the same persistent green status bar above the chat input shows the current filename and queue status. Sending does not submit the message to the current Codex Desktop conversation. Instead, it adds a snapshot of the current rule file together with the current input to a local FIFO queue.
+- While Collection mode is active, mouse input is captured by a separate transparent button positioned over the native send control, while the native control no longer receives pointer events. Keyboard and form submission are intercepted at the window capture phase. This prevents one input from being sent to both the collection CLI and the normal Desktop task.
+- Creates a new thread with Codex App Server `thread/start` for every collection item. Items do not inherit the desktop task or the history of previous collection items. Codex system rules, account configuration, and workspace instructions still apply, so “no context” here means no prior conversation history.
+- Treats the selected Markdown file as an executable collection workflow. Each CLI thread uses the active task workspace as its `cwd` and runs with `workspaceWrite`, restricted to that workspace. When the rules require source records, indexes, tags, or validation, Codex must inspect the existing project, write the actual files, and verify them instead of returning a proposed collection document. The rule file itself remains unchanged unless the current input explicitly asks to edit that rule.
+- Preserves the rule Markdown and current input verbatim in the CLI prompt. Before starting the model turn, a deterministic preflight extracts URLs, dates, Markdown link labels, and GitHub repository slugs; searches the workspace for exact input URLs with bounded results; and checks GitHub repositories concurrently with `HEAD` requests. The resulting compact JSON is a lookup aid only and never replaces the original text.
+- Instructs the collection thread to return only exact search matches, counts, and small relevant sections instead of complete file trees or large indexes. GitHub verification keeps only reachability, final URL, redirect, and status fields; detailed pages are reserved for ambiguous repositories. The local report shows preflight time, total time, first-tool time, first-write time, model profile, and any compaction count.
+- Stores queue state and concise execution reports in the plugin's `.codex-pin-profile/collection-queue/`; it no longer creates `<workspace>/collections/collection_<conversation-ID>.md`. Existing legacy aggregate files are left untouched. Collection mode is persisted per task and restored after switching away and back. Completed items appear as explicitly local **Collection execution report** cards above that task's composer; these cards are operational reports, not native assistant messages, and do not enter the desktop task's model context. While an item is pending, the status bar identifies preparation/preflight, independent-turn startup, or **independent CLI execution** and shows elapsed time. The injected UI periodically reconciles this state with the launcher so a missed runtime event cannot leave a stale “running” display. The native Desktop send button is disabled and covered by the Collection submit control; DOM replacements are guarded immediately so the same input cannot race into both the independent CLI and the Desktop task. The report panel and each report preserve their own collapsed/expanded state across unrelated UI refreshes; the panel can also be hidden until the next completion or cleared independently. Clearing reports removes only completed local reports; it does not cancel pending work, close Collection mode, or undo workspace changes. Failed items can be retried. **Clear** in the Collection status bar removes the current queue records and reports but keeps Collection mode enabled.
+- Prints bounded progress to the existing launcher terminal: rule file and workspace, preflight counts, selected model, App Server/thread/turn startup, sampled tool events, file-change paths, retry notices, context compaction, a 20-second heartbeat, and final success or failure. It never prints the full collection input or full model output. The CLI cannot be used as a human interactive prompt in that terminal because stdin/stdout carry App Server JSONL messages.
+- Pending items created by a pre-0.9.0 read-only queue are not silently upgraded to write access. After restart they are marked failed with a confirmation message and run only if the user explicitly selects **Retry**.
+- Continues waiting for automatic reconnection and transport fallback when Codex CLI reports `willRetry: true`. A collection item is marked as failed only after a non-retryable error, a final failure status, or the overall timeout.
+- Checks collection capabilities reported by the launcher. If the injection script hot-reloads while the launcher is still an older process, unavailable actions are hidden and the UI asks for a full `ChatGPT_Pin.cmd` and dedicated Codex restart instead of sending an unknown operation.
+- Makes Collection and Revision modes mutually exclusive. A missing independent CLI path prevents Collection mode from opening. If the resolved CLI cannot start or does not support `app-server`, the queued item is marked failed with a retryable error; it is never forwarded to the normal Desktop conversation, and Revision mode remains unaffected.
 
-## 当前限制
+## Current Limitations
 
-- 每个 Codex 会话只有一个活动 Pin；尚未提供会话内多 Pin 或多 Tab。
-- 回复与发送控件通过可访问名称和 DOM 结构识别；Codex 更新界面后可能需要调整选择器。
-- 当前版本不实现划线标注、右键菜单、引用胶囊、原回复精确回链、差异预览和一键恢复。
-- 工作区镜像只在修订事务完成或关闭修订模式时反向同步；未开启修订模式时，在原生文件页中的手动编辑不会自动同步到 Pin 主副本。
-- 修订模式依赖 Codex 实际执行文件修改；它不会绕过 Codex 的权限确认。如果模型只给出说明而没有修改目标文件，插件会报告“文件没有发生变化”。
-- 原生文件页的打开动作依赖当前 Codex 版本的侧栏菜单、文件筛选器和结果行布局；Codex 大版本更新后需要重新验证。
+- Each Codex conversation supports only one active Pin. Multiple Pins or tabs within one conversation are not yet supported.
+- Responses and send controls are identified through accessible names and DOM structure. Selector updates may be required after Codex UI changes.
+- This version does not implement inline marking, context menus, quote chips, exact backlinks to the original response, diff previews, or one-click restore.
+- A workspace mirror synchronizes back to the primary copy only when a revision transaction completes or Revision mode is disabled. Manual edits made on the native file page while Revision mode is disabled are not synchronized automatically.
+- Revision mode depends on Codex actually editing the file and does not bypass Codex permission prompts. If the model only explains what to do without changing the target file, Chat Pin reports that the file did not change.
+- Collection mode uses a single-concurrency queue. Disabling the mode stops accepting new requests but lets queued tasks continue. Clearing the queue immediately discards all queue records and asks App Server to interrupt the active turn, so a hidden cleared task does not keep the queue occupied. Generation checks still prevent any late completion from being recorded as a current execution report. Files already changed before cancellation cannot be rolled back automatically.
+- While Collection mode is enabled, Chat Pin takes over pointer events on the native send button. It synchronously clears the input before adding the item to the separate queue. If enqueueing fails, it restores the content after the original event chain completes, and only if the input remains empty. The status bar reports the number of historical failures separately; **Queue idle** means only that no item is currently queued or running.
+- Collection items use a non-interactive approval policy and a `workspaceWrite` sandbox whose writable root is the active task workspace. This authorizes in-scope project edits required by the selected rules, but not writes outside the workspace, destructive operations, or external side effects. Managed Codex policies can still reject a command or network request.
+- Ordinary Markdown rule files are resolved by the current task workspace and active filename. If multiple Markdown files with the same name exist in one workspace, Chat Pin refuses to enable collection and reports the ambiguity instead of guessing.
+- Deterministic URL lookup scans only common text formats, at most 4,000 files and 24 MiB per item, and reports when it was truncated. GitHub reachability is unauthenticated and cannot distinguish a missing repository from a private repository; those results are marked `not-found-or-private`. Tool-output limits beyond the deterministic preflight are prompt constraints enforced by the model, not a hard App Server byte cap.
+- Native file opening depends on the sidebar menu, file filter, and result-row layout of the current Codex version. It must be revalidated after major Codex updates.
