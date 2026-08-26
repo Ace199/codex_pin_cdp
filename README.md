@@ -4,7 +4,7 @@
   <img src="assets/chat-pin-icon.png" alt="Codex Chat Pin icon" width="128">
 </p>
 
-> Pin important answers. Revise only what changed. Collect material with isolated Codex CLI tasks.
+> Keep an important answer pinned beside the conversation. Revise only what changed. Collect material with isolated Codex CLI tasks.
 
 [![Version](https://img.shields.io/badge/version-0.9.3-6f42c1)](https://github.com/Ace199/codex-chat-pin)
 [![Windows](https://img.shields.io/badge/Windows-tested-2ea44f)](#platform-status)
@@ -14,7 +14,9 @@
 Chat Pin is a local, unofficial enhancement for Codex Desktop. It adds three
 distinct capabilities to the native workflow:
 
-1. **Pin** an important response as a real Markdown working file.
+1. **Pin** an important response in the right sidebar so it remains visible
+   while later messages continue in the conversation. The pinned response is
+   also preserved as a real Markdown working file.
 2. **Revise** only the relevant parts of that file instead of regenerating the
    entire document.
 3. **Collect** articles, links, project lists, or other material by using any
@@ -28,13 +30,14 @@ database, cookies, or account tokens.
 
 | Function | What you do | What Chat Pin does |
 | --- | --- | --- |
-| **Pin** | Choose a valuable Codex response | Preserves it as Markdown and opens it in Codex's native file viewer |
+| **Pin** | Choose a response you need to keep in view | Keeps it in the right sidebar while the conversation continues, backed by a Markdown file |
 | **Revise** | Describe a change to the active Pin | Edits only the relevant content while preserving the rest of the file |
 | **Collect** | Send repeated material under a Markdown rule file | Runs every item in a fresh Codex CLI thread and writes the requested results into the workspace |
 
 These functions solve three different problems:
 
-- A useful answer should not disappear inside a long conversation.
+- A useful answer should stay beside you instead of scrolling away inside a
+  long conversation.
 - A small revision should not create another full copy of a document.
 - Repeated intake work should not accumulate unrelated conversation context or
   stop at suggestions when the rules require actual workspace changes.
@@ -44,11 +47,13 @@ stay on your machine.
 
 ## How the three functions work
 
-### 1. Pin — turn an answer into a working document
+### 1. Pin — keep an important answer beside the conversation
 
 Click the Pin icon below a final Codex response. Chat Pin converts the rendered
-answer to Markdown, saves it, opens the native right sidebar, and selects the
-new file.
+answer to Markdown, saves it, and opens it in Codex's native right sidebar. As
+new messages push the original response farther up the conversation, the Pin
+remains available on the right for reference. It is both a persistent reference
+and a working document for the other two functions.
 
 Headings, lists, links, tables, blockquotes, emphasis, images, and fenced code
 blocks are preserved where the current Codex renderer exposes enough semantic
@@ -124,7 +129,7 @@ This runs syntax checks and the current unit/protocol test suite.
 flowchart LR
     A[ChatGPT_Pin.cmd or npm start] --> B[Dedicated Codex profile]
     B --> C[Runtime UI injection]
-    C --> D[Pin: save Markdown]
+    C --> D[Pin: keep a response in the right sidebar]
     C --> E[Revise: edit active Pin]
     C --> F[Collect: local queue]
     F --> G[Fresh Codex CLI thread per item]
