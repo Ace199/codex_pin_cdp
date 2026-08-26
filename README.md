@@ -1,39 +1,50 @@
 # Chat Pin for Codex Desktop
 
-> Turn Codex answers into living Markdown documents.
+<p align="center">
+  <img src="assets/chat-pin-icon.png" alt="Codex Chat Pin icon" width="128">
+</p>
+
+> Pin important answers. Revise only what changed. Collect material with isolated Codex CLI tasks.
 
 [![Version](https://img.shields.io/badge/version-0.9.3-6f42c1)](https://github.com/Ace199/codex-chat-pin)
 [![Windows](https://img.shields.io/badge/Windows-tested-2ea44f)](#platform-status)
 [![macOS](https://img.shields.io/badge/macOS-experimental-f0ad4e)](#platform-status)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Chat Pin is a local, unofficial enhancement for Codex Desktop. Pin a useful
-assistant response as a real Markdown file, revise that file in place, or use
-any Markdown document as a repeatable workflow for isolated Codex CLI tasks.
+Chat Pin is a local, unofficial enhancement for Codex Desktop. It adds three
+distinct capabilities to the native workflow:
+
+1. **Pin** an important response as a real Markdown working file.
+2. **Revise** only the relevant parts of that file instead of regenerating the
+   entire document.
+3. **Collect** articles, links, project lists, or other material by using any
+   Markdown file as the rules for fresh, isolated Codex CLI tasks that make
+   real changes in the current workspace.
 
 It does **not** modify the Codex installation package or read your chat
 database, cookies, or account tokens.
 
-## Why Chat Pin?
+## Three core functions
 
-Codex is excellent at generating content, but an important answer can easily
-disappear inside a long conversation. Copying it into another editor breaks the
-workflow, while asking for a revision often produces another full copy.
+| Function | What you do | What Chat Pin does |
+| --- | --- | --- |
+| **Pin** | Choose a valuable Codex response | Preserves it as Markdown and opens it in Codex's native file viewer |
+| **Revise** | Describe a change to the active Pin | Edits only the relevant content while preserving the rest of the file |
+| **Collect** | Send repeated material under a Markdown rule file | Runs every item in a fresh Codex CLI thread and writes the requested results into the workspace |
 
-Chat Pin gives the conversation one persistent working document:
+These functions solve three different problems:
 
-- **Pin** — preserve a complete answer as Markdown and open it in Codex's
-  native file viewer.
-- **Revise** — describe only the change you want; Codex edits the actual file
-  while preserving unrelated sections and code blocks.
-- **Collect** — treat any Markdown file as an executable workflow and process
-  repeated inputs in fresh, isolated Codex CLI threads.
-- **Local first** — Pins, queues, snapshots, and execution reports stay on
-  your machine.
+- A useful answer should not disappear inside a long conversation.
+- A small revision should not create another full copy of a document.
+- Repeated intake work should not accumulate unrelated conversation context or
+  stop at suggestions when the rules require actual workspace changes.
 
-## Three workflows
+Chat Pin remains local-first: Pins, queues, snapshots, and execution reports
+stay on your machine.
 
-### 1. Turn an answer into a working document
+## How the three functions work
+
+### 1. Pin — turn an answer into a working document
 
 Click the Pin icon below a final Codex response. Chat Pin converts the rendered
 answer to Markdown, saves it, opens the native right sidebar, and selects the
@@ -43,7 +54,7 @@ Headings, lists, links, tables, blockquotes, emphasis, images, and fenced code
 blocks are preserved where the current Codex renderer exposes enough semantic
 structure. Code-toolbar labels such as `Plain text` and `Copy code` are removed.
 
-### 2. Revise without regenerating everything
+### 2. Revise — change only what needs to change
 
 Open the active Pin and enable **Revise** next to **View Source**. Then write
 only the requested change:
@@ -57,7 +68,7 @@ instructions in the visible composer. It saves a local pre-edit snapshot and
 checks the file hash after the turn, so a normal text answer is not mistaken
 for a successful revision.
 
-### 3. Run repeated inputs through one Markdown workflow
+### 3. Collect — execute repeated inputs under one Markdown workflow
 
 Open any Markdown file and enable **Collect**. Each submitted input is removed
 from the normal Desktop send path and added to a local FIFO queue. A separate
@@ -113,10 +124,11 @@ This runs syntax checks and the current unit/protocol test suite.
 flowchart LR
     A[ChatGPT_Pin.cmd or npm start] --> B[Dedicated Codex profile]
     B --> C[Runtime UI injection]
-    C --> D[Pin and Revise]
-    C --> E[Collection queue]
-    E --> F[Independent Codex CLI thread]
-    F --> G[Current task workspace]
+    C --> D[Pin: save Markdown]
+    C --> E[Revise: edit active Pin]
+    C --> F[Collect: local queue]
+    F --> G[Fresh Codex CLI thread per item]
+    G --> H[Current task workspace]
 ```
 
 The launcher starts an isolated Codex Desktop instance and injects the UI at
