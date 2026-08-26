@@ -1,65 +1,87 @@
-# Chat Pin for Codex Desktop
-
 <p align="center">
-  <img src="assets/chat-pin-icon.png" alt="Codex Chat Pin icon" width="128">
+  <img src="assets/chat-pin-icon.png" alt="Codex Chat Pin icon" width="132">
 </p>
 
-> Keep an important answer pinned beside the conversation. Revise only what changed. Collect material with isolated Codex CLI tasks.
+<h1 align="center">Codex Chat Pin</h1>
 
-[![Version](https://img.shields.io/badge/version-0.9.3-6f42c1)](https://github.com/Ace199/codex-chat-pin)
-[![Windows](https://img.shields.io/badge/Windows-tested-2ea44f)](#platform-status)
-[![macOS](https://img.shields.io/badge/macOS-experimental-f0ad4e)](#platform-status)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+<p align="center">
+  <strong>Keep the answer that matters in sight — and keep working on it.</strong>
+</p>
 
-Chat Pin is a local, unofficial enhancement for Codex Desktop. It adds three
-distinct capabilities to the native workflow:
+<p align="center">
+  Pin a Codex reply beside the conversation, revise it in place, or use Markdown<br>
+  to run repeatable collection workflows in fresh Codex CLI tasks.
+</p>
 
-1. **Pin** an important response in the right sidebar so it remains visible
-   while later messages continue in the conversation. The pinned response is
-   also preserved as a real Markdown working file.
-2. **Revise** only the relevant parts of that file instead of regenerating the
-   entire document.
-3. **Collect** articles, links, project lists, or other material by using any
-   Markdown file as the rules for fresh, isolated Codex CLI tasks that make
-   real changes in the current workspace.
+<p align="center">
+  <a href="https://github.com/Ace199/codex-chat-pin"><img src="https://img.shields.io/badge/version-0.9.3-6f42c1" alt="Version 0.9.3"></a>
+  <a href="#platform-status"><img src="https://img.shields.io/badge/Windows-tested-2ea44f" alt="Windows tested"></a>
+  <a href="#platform-status"><img src="https://img.shields.io/badge/macOS-experimental-f0ad4e" alt="macOS experimental"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
+</p>
 
-It does **not** modify the Codex installation package or read your chat
-database, cookies, or account tokens.
+> A conversation keeps moving. Your most useful answer should not disappear
+> with it.
 
-## Three core functions
+Codex Chat Pin is a local, unofficial enhancement that adds a persistent
+working layer to Codex Desktop. One click keeps an important reply in the native
+right sidebar while the conversation continues below. That reply becomes a
+real Markdown file you can reference, revise, and build on.
 
-| Function | What you do | What Chat Pin does |
+For repeated intake work, **Collect** goes further: choose any Markdown file as
+the processing rules, submit articles, links, project lists, notes, or raw data,
+and let a fresh Codex CLI task execute each item directly in the workspace.
+
+Pins, snapshots, queue metadata, and execution reports stay on your machine.
+Chat Pin does not patch the Codex installation or read your chat database,
+cookies, or account tokens. Codex Desktop and Codex CLI continue to use their
+configured OpenAI services normally.
+
+## One working layer, three ways to use it
+
+| | Use it when… | Result |
 | --- | --- | --- |
-| **Pin** | Choose a response you need to keep in view | Keeps it in the right sidebar while the conversation continues, backed by a Markdown file |
-| **Revise** | Describe a change to the active Pin | Edits only the relevant content while preserving the rest of the file |
-| **Collect** | Send repeated material under a Markdown rule file | Runs every item in a fresh Codex CLI thread and writes the requested results into the workspace |
+| **📌 Pin** | One reply is too important to lose in the scroll | It stays available in the right sidebar and is preserved as Markdown |
+| **✏️ Revise** | Only one section needs to change | Codex edits the relevant part of the active Pin and preserves everything else |
+| **📥 Collect** <sup>Advanced / Beta · Codex CLI required</sup> | You repeatedly process articles, links, projects, or datasets | Every input runs in a fresh Codex CLI thread and the required changes are written into the workspace |
 
-These functions solve three different problems:
+### The core loop
 
-- A useful answer should stay beside you instead of scrolling away inside a
-  long conversation.
-- A small revision should not create another full copy of a document.
-- Repeated intake work should not accumulate unrelated conversation context or
-  stop at suggestions when the rules require actual workspace changes.
+```text
+Useful Codex reply  →  Pin it on the right  →  Keep chatting
+                              ↓
+                     Revise the same file
+```
 
-Chat Pin remains local-first: Pins, queues, snapshots, and execution reports
-stay on your machine.
+For power users, a second loop turns Markdown into an executable workflow:
+
+```text
+Markdown rules  +  New material  →  Fresh Codex CLI task  →  Real workspace changes
+```
+
+This makes Chat Pin useful for long coding tasks, plans and specifications,
+research notes, GitHub project libraries, article archives, investment records,
+and any workflow where the exact document structure needs to survive the next
+conversation turn.
 
 ## How the three functions work
 
-### 1. Pin — keep an important answer beside the conversation
+### 📌 Pin — keep the important answer beside you
 
 Click the Pin icon below a final Codex response. Chat Pin converts the rendered
 answer to Markdown, saves it, and opens it in Codex's native right sidebar. As
 new messages push the original response farther up the conversation, the Pin
-remains available on the right for reference. It is both a persistent reference
-and a working document for the other two functions.
+remains available on the right for reference.
+
+This is the main experience: **the conversation moves; the important answer
+stays**. The Markdown file is the durable backing for that visible Pin, not the
+reason you have to leave the conversation.
 
 Headings, lists, links, tables, blockquotes, emphasis, images, and fenced code
 blocks are preserved where the current Codex renderer exposes enough semantic
 structure. Code-toolbar labels such as `Plain text` and `Copy code` are removed.
 
-### 2. Revise — change only what needs to change
+### ✏️ Revise — change one part, not the whole answer
 
 Open the active Pin and enable **Revise** next to **View Source**. Then write
 only the requested change:
@@ -73,7 +95,13 @@ instructions in the visible composer. It saves a local pre-edit snapshot and
 checks the file hash after the turn, so a normal text answer is not mistaken
 for a successful revision.
 
-### 3. Collect — execute repeated inputs under one Markdown workflow
+Instead of producing another near-duplicate response, the active working file
+is updated in place while unrelated Markdown and code blocks are preserved.
+
+### 📥 Collect — turn Markdown rules into repeated execution
+
+> **Requires a separately installed Codex CLI.** Pin and Revise work without
+> it; only Collection launches independent CLI tasks.
 
 Open any Markdown file and enable **Collect**. Each submitted input is removed
 from the normal Desktop send path and added to a local FIFO queue. A separate
@@ -89,6 +117,29 @@ investment notes, article intake, structured knowledge bases, and repeated
 project maintenance. The rule file can require actual source records, index
 updates, link verification, or other workspace changes—the CLI must execute
 those steps rather than merely propose them.
+
+Each item starts without the previous Desktop conversation or earlier
+Collection items. Your rule file stays constant; the incoming material changes.
+That keeps repeated processing focused and prevents unrelated chat context from
+silently accumulating.
+
+#### Install Codex CLI for Collection
+
+With Node.js installed, the shortest cross-platform setup is:
+
+```bash
+npm install -g @openai/codex
+codex --version
+codex
+```
+
+The last command starts Codex CLI. On the first run, choose **Sign in with
+ChatGPT** (or another available sign-in method), complete authentication, and
+then close the CLI. Restart Chat Pin if it was already running so the launcher
+can detect the new installation.
+
+See the [official Codex CLI documentation](https://learn.chatgpt.com/docs/codex/cli)
+for current platform-specific installation and authentication options.
 
 ## Quick start
 
